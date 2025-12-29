@@ -1,4 +1,3 @@
-
 import os
 
 import pandas as pd
@@ -6,15 +5,51 @@ from sklearn import preprocessing
 import pickle
 
 from lib.utils import *
-#from utils import *
+# from utils import *
 
-def preprocessTrainingData(file, sep=None, min_max_scaler = None, training = True):
+
+def _normalize_swat_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Normalize common SWaT column-name variants created by different preprocessing scripts."""
+    df = df.copy()
+
+    # Trim whitespace everywhere (raw SWaT headers often contain trailing spaces)
+    df.columns = [str(c).strip() for c in df.columns]
+
+    # If a pandas index was written to CSV, it often comes back as 'Unnamed: 0'
+    unnamed_like = [c for c in df.columns if str(c).startswith("Unnamed:")]
+    if unnamed_like:
+        df = df.drop(columns=unnamed_like)
+
+    # Canonicalize label column
+    rename_map = {}
+    if "Normal/Attack" in df.columns and "attack" not in df.columns:
+        rename_map["Normal/Attack"] = "attack"
+    if "Attack" in df.columns and "attack" not in df.columns:
+        rename_map["Attack"] = "attack"
+    if rename_map:
+        df = df.rename(columns=rename_map)
+
+    return df
+
+
+def _read_csv_robust(file: str, sep=None) -> pd.DataFrame:
+    """Read CSV while being tolerant to different separators and pandas engines."""
+    try:
+        df = pd.read_csv(file, sep=sep)
+    except Exception:
+        # Fallback: let pandas infer delimiter with python engine
+        df = pd.read_csv(file, sep=None, engine="python")
+    return _normalize_swat_columns(df)
+
+
+def preprocessTrainingData(file, sep=None, min_max_scaler=None, training=True):
     # === Normal period ====
-    normal = pd.read_csv(file, sep= sep)  # , nrows=1000)
-    if "Attack" in normal.columns:
-        normal = normal.drop(["Timestamp", "Attack"], axis=1)
-    else:
-        normal = normal.drop(["Timestamp", 'Normal/Attack'], axis=1)
+    normal = _read_csv_robust(file, sep=sep)  # , nrows=1000)
+
+    # Drop non-sensor columns if present
+    drop_cols = [c for c in ["Timestamp", "attack"] if c in normal.columns]
+    if drop_cols:
+        normal = normal.drop(drop_cols, axis=1)
 
     # Transform all columns into float64
     for i in list(normal):
@@ -26,16 +61,29 @@ def preprocessTrainingData(file, sep=None, min_max_scaler = None, training = Tru
 
     return normal.values, min_max_scaler
 
-def preprocessTestingData(file, sep=None, min_max_scaler = None, training=False):
-    # === Normal period ====
-    attack = pd.read_csv(file, sep= sep)  # , nrows=1000)
 
-    if "Attack" in attack.columns:
-        labels = attack["Attack"].values
-        attack = attack.drop(["Timestamp", "Attack"], axis=1)
-    else:
-        labels = [float(label != 'Normal') for label in attack["Normal/Attack"].values]
-        attack = attack.drop(["Timestamp", 'Normal/Attack'], axis=1)
+def preprocessTestingData(file, sep=None, min_max_scaler=None, training=False):
+    # === Attack period ====
+    attack = _read_csv_robust(file, sep=sep)  # , nrows=1000)
+
+    if "attack" not in attack.columns:
+        raise KeyError(
+            "Could not find label column in SWaT test file. Expected one of: 'attack', 'Attack', 'Normal/Attack'. "
+            f"Available columns: {list(attack.columns)}. "
+            "If the list looks wrong (e.g., a single huge column), your CSV separator may be incorrect."
+        )
+
+    # Labels may be numeric (0/1) or strings ('Normal'/'Attack')
+    raw_labels = attack["attack"].values
+    try:
+        labels = raw_labels.astype(float)
+    except Exception:
+        labels = [float(str(label).strip() != "Normal") for label in raw_labels]
+
+    # Drop non-sensor columns if present
+    drop_cols = [c for c in ["Timestamp", "attack"] if c in attack.columns]
+    if drop_cols:
+        attack = attack.drop(drop_cols, axis=1)
 
     # Transform all columns into float64
     for i in list(attack):
@@ -367,7 +415,6 @@ def load_data3(normal, attack, labels, device = "gpu", window_size = 12, val_rat
 
     return train_loader, val_loader, test_loader, y_test_labels, min_max_scaler
 
-
 def load_data_unsup_train(attack, labels, device = "gpu", window_size = 12, val_ratio = 0.2, batch_size = 64, is_down_sample = False, down_len=10):
     ### 
     # Receive samples and labels screened by unsupervised methods,  extract continuous time windows, and use them as the training set
@@ -588,6 +635,9 @@ def save_column_to_pkl(filename, outputName):
 
     with open(outputName+".txt","w")as f:
         f.write(" ".join(normal.columns))
+
+
+
 
 
 

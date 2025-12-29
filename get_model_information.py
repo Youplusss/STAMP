@@ -1,105 +1,59 @@
-
-import  os
+import os
 import argparse
+
+from lib.cli import add_common_args, finalize_args
+from lib.paths import resolve_dataset_paths
 
 
 parser = argparse.ArgumentParser(description='PyTorch Prediction Model on Time-series Dataset')
-parser.add_argument('--data', type=str, default='SWaT',
-                    help='type of the dataset (SWaT, WADI, ...)')
-parser.add_argument('--filename', type=str, default='SWaT_Dataset_Normal_v1.csv',
-                    help='filename of the dataset')
-parser.add_argument('--debug', default=False, type=eval)
-parser.add_argument('--real_value', default=False, type=eval)
-parser.add_argument('--log_dir', default="expe", type=str)
-parser.add_argument('--model', default="v2_", type=str)
-parser.add_argument('--pred_model', default="gat", type=str)
-parser.add_argument('--gpu_id', default="0", type=str)
-parser.add_argument('--temp_method', default="SAttn", type=str)
-
-
-### graph constructure
-parser.add_argument('--nnodes', type=int, default=38, help='number of nodes')
-parser.add_argument('--top_k', type=int, default=10, help='top-k')
-parser.add_argument('--em_dim', type=int, default=32, help='embedding dimension')
-parser.add_argument('--alpha', type=int, default=3, help='alpha')
-parser.add_argument('--hidden_dim', type=int, default=32, help='hidden_dim')
-parser.add_argument('--att_option', type=int, default=1, help='att_option')
-
-### pred model
-parser.add_argument('--window_size', type=int, default=15, help='window_size')
-parser.add_argument('--n_pred', type=int, default=3, help='n_pred')
-parser.add_argument('--temp_kernel', type=int, default=5, help='temp_kernel')
-parser.add_argument('--in_channels', type=int, default=1, help='in_channels')
-parser.add_argument('--out_channels', type=int, default=1, help='out_channels')
-
-parser.add_argument('--layer_num', type=int, default=2, help='layer_num')
-parser.add_argument('--act_func', type=str, default="GLU", help='act_func')
-parser.add_argument('--pred_lr_init', type=float, default=0.001, help='pred_lr_init')
-
-### Attention
-parser.add_argument('--embed_size', type=int, default=64, help='embed_size')
-parser.add_argument('--num_heads', type=int, default=8, help='num_heads')
-parser.add_argument('--num_layers', type=int, default=1, help='num_attn_layers')
-parser.add_argument('--ffwd_size', type=int, default=32, help='feed_foward_layer_size')
-parser.add_argument('--is_conv', type=eval, default=False)
-parser.add_argument('--return_weight', type=eval, default=False)
-
-### AE
-parser.add_argument('--latent_size', type=int, default=1, help='latent_size')
-parser.add_argument('--ae_lr_init', type=float, default=0.001, help='ae_lr_init')
-
-parser.add_argument('--seed', type=int, default=666, help='seed')
-parser.add_argument('--val_ratio', type=float, default=.2, help='val_ratio')
-parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
-parser.add_argument('--batch_size', type=int, default=64, help='batch size')
-parser.add_argument('--epochs', type=int, default=50, help='number of epoch')
-parser.add_argument('--test_alpha', type=float, default=.5, help='test_alpha')
-parser.add_argument('--test_beta', type=float, default=.0, help='test_beta')
-parser.add_argument('--test_gamma', type=float, default=0.5, help='test_gamma')
-parser.add_argument('--is_down_sample', type=eval, default=True, help='is_down_sample')
-parser.add_argument('--down_len', type=int, default=100, help='down_len')
-
-parser.add_argument('--early_stop', default=True, type=eval)
-parser.add_argument('--early_stop_patience', type=int, default=10, help='early_stop_patience')
-
-parser.add_argument('--lr_decay', default=True, type=eval)
-parser.add_argument('--lr_decay_rate', default=0.5, type=float)
-parser.add_argument('--lr_decay_step', default="5,20,40,70", type=str)
-parser.add_argument('--search_steps', default=50, type=int)
-parser.add_argument('--is_mas', default=True, type=eval)
-
-args = parser.parse_args()
-
-args.model = args.model + args.pred_model
+add_common_args(parser)
+args = finalize_args(parser.parse_args())
+# get_model_information is NPZ-based; keep defaults close to previous behavior
+if args.unsup_train_size is None:
+    args.unsup_train_size = 15000
 
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
 
 from model.net import *
 from trainer import Trainer, Tester
 from lib.logger import get_logger
-from lib.dataloader_smd import load_data, load_data2, load_data3, load_data_unsup_train
+from lib.dataloader_smd import load_data3
 from lib.utils import *
 from lib.metrics import *
 from model.utils import *
 from lib.evaluate import *
 
-
-
 DEVICE = get_default_device()
 
-base_dir = os.getcwd()
+paths = resolve_dataset_paths(args.data, group_name=args.group_name, train_file=args.train_file, test_file=args.test_file, unsup_npz=args.unsup_npz)
 
 
+def _load_unsup_npz(npz_path: str):
+    if npz_path is None:
+        raise ValueError("--unsup_npz is required")
+    if not os.path.isfile(npz_path):
+        raise FileNotFoundError(f"unsup npz not found: {npz_path}")
+    npz = np.load(npz_path, allow_pickle=True)
+    keys = set(npz.keys())
+    print(f"[INFO] loaded unsup npz: {npz_path}; keys={sorted(keys)}")
+    if {'a','b','c','d'}.issubset(keys):
+        return npz['a'], npz['b'], npz['c'], npz['d']
+    if {'a','b'}.issubset(keys) and 'c' not in keys and 'd' not in keys:
+        attack = npz['a']
+        labels = npz['b'].reshape(-1)
+        n_train = int(args.unsup_train_size)
+        n_train = max(1, min(n_train, len(labels) - 1))
+        return attack[:n_train], labels[:n_train], attack[n_train:], labels[n_train:]
+    arr_keys = [k for k in keys if k.startswith('arr_')]
+    if len(arr_keys) >= 4:
+        arr = sorted(arr_keys)
+        return npz[arr[0]], npz[arr[1]], npz[arr[2]], npz[arr[3]]
+    raise KeyError(f"Unsupported npz format; keys={sorted(keys)}")
 
-smd_unsup_data = np.load(".../test_data_smd_unsup.npz")
-attack = smd_unsup_data['a']
-labels = smd_unsup_data['b']
-attack_train = attack[:15000]
-label_train = labels[:15000]
-attack_test = attack[15000:]
-label_test = labels[15000:]
 
-train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = load_data3(attack_train, attack_test, label_test,
+attack_train, train_labels, attack_test, test_labels = _load_unsup_npz(paths.unsup_npz)
+
+train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = load_data3(attack_train, attack_test, test_labels,
                                                                                     device=DEVICE,
                                                                                     window_size=args.window_size,
                                                                                     val_ratio=0.05,
@@ -140,7 +94,7 @@ trainer = Trainer(pred_model, pred_loss, pred_optimizer, ae_model, ae_loss, ae_o
 train_history, val_history = trainer.train()
 
 
-model_path = "./expe/"+'best_model_' + args.data + "_" + args.model + '.pth'
+model_path = os.path.join(args.log_dir, 'best_model_' + args.data + "_" + args.model + '.pth')
 logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data = args.data)
 tester = Tester(pred_model, ae_model, args, min_max_scaler, logger, path = model_path, alpha=args.test_alpha, beta=args.test_beta, gamma= args.test_gamma)
 
@@ -171,7 +125,7 @@ test_generate_results = [test_generate_list, test_generate_construct_list]
 
 
 # get model information (three types of feature importance)
-check_point = torch.load(model_path, map_location = map_location)
+check_point = torch.load(model_path, map_location=map_location, weights_only=False)
 pred_state_dict = check_point['pred_state_dict']
 
 pred_model.load_state_dict(pred_state_dict)
@@ -181,4 +135,5 @@ pred_model.to(DEVICE)
 target_num = args.nnodes
 sort_graph_weight_out, sort_graph_weight_in = get_graph_weight(pred_model, args.nnodes, target_num)
 sort_score_weight = get_score_weight(test_pred_results, test_ae_results,  test_generate_results, y_test_labels, topk = 1, option = 2, method="max", alpha =args.test_alpha, beta=args.test_beta, gamma = args.test_gamma, target_num=target_num)
-np.savez('/weights/node_weights_SMD_unsup_train_STAMP.npz', a=sort_graph_weight_out, b=sort_graph_weight_in, c=sort_score_weight)
+os.makedirs('weights', exist_ok=True)
+np.savez(os.path.join('weights', f'node_weights_{args.data}_unsup_train_STAMP.npz'), a=sort_graph_weight_out, b=sort_graph_weight_in, c=sort_score_weight)

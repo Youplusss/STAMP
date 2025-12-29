@@ -1,146 +1,171 @@
-
-
-import  os
+import os
 import argparse
 
-import numpy as np
+from lib.cli import add_common_args, finalize_args
+from lib.paths import resolve_dataset_paths
 
 from lib.evaluate import *
 
 parser = argparse.ArgumentParser(description='PyTorch Prediction Model on Time-series Dataset')
-parser.add_argument('--data', type=str, default='SWaT',
-                    help='type of the dataset (SWaT, WADI, ...)')
-parser.add_argument('--filename', type=str, default='SWaT_Dataset_Normal_v1.csv',
-                    help='filename of the dataset')
-parser.add_argument('--debug', default=False, type=eval)
-parser.add_argument('--real_value', default=False, type=eval)
-parser.add_argument('--log_dir', default="expe", type=str)
-parser.add_argument('--model', default="v2_", type=str)## ourModel
-parser.add_argument('--pred_model', default="gat", type=str)
-parser.add_argument('--gpu_id', default="0", type=str)
-parser.add_argument('--temp_method', default="SAttn", type=str)
-
-### graph constructure
-parser.add_argument('--nnodes', type=int, default=45, help='number of nodes')
-parser.add_argument('--top_k', type=int, default=10, help='top-k')
-parser.add_argument('--em_dim', type=int, default=32, help='embedding dimension')
-parser.add_argument('--alpha', type=int, default=3, help='alpha')
-parser.add_argument('--hidden_dim', type=int, default=32, help='hidden_dim')
-parser.add_argument('--att_option', type=int, default=1, help='att_option')
-
-### pred model
-parser.add_argument('--window_size', type=int, default=15, help='window_size')
-parser.add_argument('--n_pred', type=int, default=3, help='n_pred')
-parser.add_argument('--temp_kernel', type=int, default=5, help='temp_kernel')
-parser.add_argument('--in_channels', type=int, default=1, help='in_channels')
-parser.add_argument('--out_channels', type=int, default=1, help='out_channels')
-
-parser.add_argument('--layer_num', type=int, default=2, help='layer_num')
-parser.add_argument('--act_func', type=str, default="GLU", help='act_func')
-parser.add_argument('--pred_lr_init', type=float, default=0.001, help='pred_lr_init')
-
-### Attention
-parser.add_argument('--embed_size', type=int, default=64, help='embed_size')
-parser.add_argument('--num_heads', type=int, default=8, help='num_heads')
-parser.add_argument('--num_layers', type=int, default=1, help='num_attn_layers')
-parser.add_argument('--ffwd_size', type=int, default=32, help='feed_foward_layer_size')
-parser.add_argument('--is_conv', type=eval, default=False)
-parser.add_argument('--return_weight', type=eval, default=False)
-
-### AE
-parser.add_argument('--latent_size', type=int, default=1, help='latent_size')
-parser.add_argument('--ae_lr_init', type=float, default=0.001, help='ae_lr_init')
-
-parser.add_argument('--seed', type=int, default=666, help='seed')
-parser.add_argument('--val_ratio', type=float, default=.2, help='val_ratio')
-parser.add_argument('--dropout', type=float, default=0.1, help='dropout')
-parser.add_argument('--batch_size', type=int, default=64, help='batch size')
-parser.add_argument('--epochs', type=int, default=50, help='number of epoch')
-parser.add_argument('--test_alpha', type=float, default=.5, help='test_alpha')
-parser.add_argument('--test_beta', type=float, default=.0, help='test_beta')
-parser.add_argument('--test_gamma', type=float, default=0.5, help='test_gamma')
-parser.add_argument('--is_down_sample', type=eval, default=True, help='is_down_sample')
-parser.add_argument('--down_len', type=int, default=100, help='down_len')
-
-parser.add_argument('--early_stop', default=True, type=eval)
-parser.add_argument('--early_stop_patience', type=int, default=10, help='early_stop_patience')
-
-parser.add_argument('--lr_decay', default=True, type=eval)
-parser.add_argument('--lr_decay_rate', default=0.5, type=float)
-parser.add_argument('--lr_decay_step', default="5,20,40,70", type=str)
-parser.add_argument('--search_steps', default=50, type=int)
-parser.add_argument('--is_mas', default=True, type=eval)
-args = parser.parse_args()
-
-args.model = args.model + args.pred_model
+add_common_args(parser)
+args = finalize_args(parser.parse_args())
 
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
 
 from model.net import *
 from trainer import Tester
 from lib.logger import get_logger
-#from lib.dataloader_swat import load_data, load_data2
-from lib.dataloader_smd import load_data, load_data2
-#from lib.dataloader_wadi import load_data, load_data2
-#from lib.dataloader_msl_smap import load_data, load_data2
+from lib.dataloader_swat import load_data as swat_load_data, load_data2 as swat_load_data2
+from lib.dataloader_wadi import load_data as wadi_load_data, load_data2 as wadi_load_data2
+from lib.dataloader_smd import load_data as smd_load_data, load_data2 as smd_load_data2
+from lib.dataloader_msl_smap import load_data as msl_load_data, load_data2 as msl_load_data2
 from lib.utils import *
-from lib.metrics import *
 from model.utils import *
 
 
+def _infer_nnodes_from_csv(train_csv_path: str) -> int:
+    import pandas as pd
+
+    df = pd.read_csv(train_csv_path)
+    df.columns = [str(c).strip() for c in df.columns]
+    drop_cols = [c for c in ["Timestamp", "attack", "Attack", "Normal/Attack", "label", "Normal/Attack ", "Date", "Time", "Row", "Date_Time", "Date time"] if c in df.columns]
+    if drop_cols:
+        df = df.drop(columns=drop_cols)
+    unnamed_like = [c for c in df.columns if str(c).startswith("Unnamed:")]
+    if unnamed_like:
+        df = df.drop(columns=unnamed_like)
+    return df.shape[1]
+
 
 DEVICE = get_default_device()
-
 args.device = DEVICE
 
-base_dir = os.getcwd()
+paths = resolve_dataset_paths(
+    args.data,
+    data_root=args.data_root,
+    dataset_root=args.dataset_root,
+    group_name=args.group_name,
+    train_file=args.train_file,
+    test_file=args.test_file,
+)
 
-if args.is_mas:  #perform moving average to extend channels
-    train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = load_data2('SMD', 'machine-1-1',
-                                                                                    device=DEVICE,
-                                                                                    window_size=args.window_size,
-                                                                                    val_ratio=args.val_ratio,
-                                                                                    batch_size=args.batch_size,
-                                                                                    is_down_sample=args.is_down_sample,
-                                                                                    down_len=args.down_len)
+data_lower = args.data.lower()
+
+if data_lower == "swat":
+    if paths.train_csv is None or paths.test_csv is None:
+        raise FileNotFoundError("SWaT train/test csv paths not resolved")
+
+    inferred_nnodes = _infer_nnodes_from_csv(paths.train_csv)
+    if args.nnodes is None or args.nnodes != inferred_nnodes:
+        if args.nnodes is not None and args.nnodes != inferred_nnodes:
+            print(f"[WARN] args.nnodes={args.nnodes} but SWaT CSV has {inferred_nnodes} feature columns. Using nnodes={inferred_nnodes}.")
+        args.nnodes = inferred_nnodes
+
+    if args.is_mas:
+        train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = swat_load_data2(paths.train_csv, paths.test_csv,
+                                                                                               device=DEVICE,
+                                                                                               window_size=args.window_size,
+                                                                                               val_ratio=args.val_ratio,
+                                                                                               batch_size=args.batch_size,
+                                                                                               is_down_sample=args.is_down_sample,
+                                                                                               down_len=args.down_len)
+    else:
+        train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = swat_load_data(paths.train_csv, paths.test_csv,
+                                                                                              device=DEVICE,
+                                                                                              window_size=args.window_size,
+                                                                                              val_ratio=args.val_ratio,
+                                                                                              batch_size=args.batch_size,
+                                                                                              is_down_sample=args.is_down_sample,
+                                                                                              down_len=args.down_len)
+
+elif data_lower == "wadi":
+    if paths.train_csv is None or paths.test_csv is None:
+        raise FileNotFoundError("WADI train/test csv paths not resolved")
+
+    inferred_nnodes = _infer_nnodes_from_csv(paths.train_csv)
+    if args.nnodes is None or args.nnodes != inferred_nnodes:
+        if args.nnodes is not None and args.nnodes != inferred_nnodes:
+            print(f"[WARN] args.nnodes={args.nnodes} but WADI CSV has {inferred_nnodes} feature columns. Using nnodes={inferred_nnodes}.")
+        args.nnodes = inferred_nnodes
+
+    if args.is_mas:
+        train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = wadi_load_data2(paths.train_csv, paths.test_csv,
+                                                                                               device=DEVICE,
+                                                                                               window_size=args.window_size,
+                                                                                               val_ratio=args.val_ratio,
+                                                                                               batch_size=args.batch_size,
+                                                                                               is_down_sample=args.is_down_sample,
+                                                                                               down_len=args.down_len)
+    else:
+        train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = wadi_load_data(paths.train_csv, paths.test_csv,
+                                                                                              device=DEVICE,
+                                                                                              window_size=args.window_size,
+                                                                                              val_ratio=args.val_ratio,
+                                                                                              batch_size=args.batch_size,
+                                                                                              is_down_sample=args.is_down_sample,
+                                                                                              down_len=args.down_len)
+
+elif data_lower == "smd":
+    group_name = paths.group_name or "machine-1-1"
+
+    if args.is_mas:
+        train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = smd_load_data2(args.data, group_name,
+                                                                                               device=DEVICE,
+                                                                                               window_size=args.window_size,
+                                                                                               val_ratio=args.val_ratio,
+                                                                                               batch_size=args.batch_size,
+                                                                                               is_down_sample=args.is_down_sample,
+                                                                                               down_len=args.down_len)
+    else:
+        train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = smd_load_data(args.data, group_name,
+                                                                                              device=DEVICE,
+                                                                                              window_size=args.window_size,
+                                                                                              val_ratio=args.val_ratio,
+                                                                                              batch_size=args.batch_size,
+                                                                                              is_down_sample=args.is_down_sample,
+                                                                                              down_len=args.down_len)
+
+elif data_lower in ["msl", "smap"]:
+    if args.is_mas:
+        train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = msl_load_data2(args.data,
+                                                                                               device=DEVICE,
+                                                                                               window_size=args.window_size,
+                                                                                               val_ratio=args.val_ratio,
+                                                                                               batch_size=args.batch_size,
+                                                                                               is_down_sample=args.is_down_sample,
+                                                                                               down_len=args.down_len)
+    else:
+        train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = msl_load_data(args.data,
+                                                                                              device=DEVICE,
+                                                                                              window_size=args.window_size,
+                                                                                              val_ratio=args.val_ratio,
+                                                                                              batch_size=args.batch_size,
+                                                                                              is_down_sample=args.is_down_sample,
+                                                                                              down_len=args.down_len)
 else:
-    train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = load_data('SMD', 'machine-1-1', device = DEVICE,
-                                                                                window_size = args.window_size, val_ratio = args.val_ratio,
-                                                                                batch_size = args.batch_size,
-                                                                                is_down_sample=args.is_down_sample, down_len=args.down_len)
+    raise ValueError(f"Unsupported dataset: {args.data}")
 
-## set seed
+# ---- Model and evaluation ----
 init_seed(args.seed)
-
 channels_list = [[16,8,32],[32,8,64]]
 
 AE_IN_CHANNELS = args.window_size * args.nnodes * args.in_channels
 latent_size = args.window_size * args.latent_size
 
-
 pred_model = STATModel(args, DEVICE, args.window_size - args.n_pred, channels_list, static_feat=None)
-# pred_model = to_device(pred_model, DEVICE)
-
-
 ae_model = EncoderDecoder(AE_IN_CHANNELS, latent_size, AE_IN_CHANNELS, not args.real_value)
-# ae_model = to_device(ae_model, DEVICE)
 
+logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data)
+model_path = os.path.join(args.log_dir, 'best_model_' + args.data + "_" + args.model + '.pth')
 
-logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data = args.data)
-
-model_path = "./expe/"+'best_model_' + args.data + "_" + args.model + '.pth'
-tester = Tester(pred_model, ae_model, args, min_max_scaler, logger, path = model_path, alpha=args.test_alpha, beta=args.test_beta, gamma= args.test_gamma)
+tester = Tester(pred_model, ae_model, args, min_max_scaler, logger, path=model_path,
+                alpha=args.test_alpha, beta=args.test_beta, gamma=args.test_gamma)
 
 map_location = torch.device(DEVICE)
-# map_location = lambda storage.cuda(0), loc: storage
-##[val_gt_list, val_pred_list, val_construct_list]
-
 
 test_results = tester.testing(test_loader, map_location)
 
-
 test_y_pred, test_loss1_list, test_loss2_list, test_pred_list, test_gt_list, test_origin_list, test_construct_list, test_generate_list, test_generate_construct_list = concate_results(test_results)
-
 
 print("scores: ", len(test_y_pred), test_y_pred.mean())
 print("loss1: ", len(test_loss1_list), test_loss1_list.mean())
@@ -148,55 +173,32 @@ print("loss2: ", len(test_loss2_list), test_loss2_list.mean())
 print("y_pred: ", len(test_y_pred))
 print("y_test_labels: ", len(y_test_labels))
 
-
 start = test_y_pred.min()
 end = test_y_pred.max()
 
-
 test_pred_results = [test_pred_list, test_gt_list]
-
 test_ae_results = [test_construct_list, test_origin_list]
-
 test_generate_results = [test_generate_list, test_generate_construct_list]
 
-
-"""
-1. option: Normalization 
-    if option == 1:
-        n_err_mid, n_err_iqr = get_err_median_and_iqr(test_predict, test_gt)
-    elif option == 2:
-        n_err_mid, n_err_iqr = get_err_mean_and_std(test_predict, test_gt)
-    elif option == 3:
-        n_err_mid, n_err_iqr = get_err_mean_and_quantile(test_predict, test_gt, 0.25)
-    else:
-        n_err_mid, n_err_iqr = get_err_median_and_quantile(test_predict, test_gt, 0.25)
-        
-2. method: [mean, max, sum]
-    if method in ["max", "MAX"]:
-        return np.array(test_ae_scores).max(axis=0)
-    elif method in ["mean", "MEAN"]:
-        return np.array(test_ae_scores).mean(axis=0)
-    else:
-        return np.array(test_ae_scores).sum(axis=0)
-"""
 print("================= Find best f1 from score: normalization loss ... =================")
-info,test_scores,predict = get_final_result(test_pred_results, test_ae_results,  test_generate_results, y_test_labels, topk = 1, option = 2, method="max", alpha =args.test_alpha, beta=args.test_beta, gamma = args.test_gamma, search_steps=args.search_steps)
-#info = get_final_result_POT(test_pred_results, test_ae_results, test_generate_results, train_pred_results, train_ae_results, train_generate_results, y_test_labels, topk = 1, option = 2, method="max", alpha =args.test_alpha, beta=args.test_beta, gamma = args.test_gamma, search_steps=args.search_steps)
+info, test_scores, predict = get_final_result(test_pred_results, test_ae_results, test_generate_results, y_test_labels,
+                                              topk=1, option=2, method="max",
+                                              alpha=args.test_alpha, beta=args.test_beta, gamma=args.test_gamma,
+                                              search_steps=args.search_steps)
 print(info)
-
 
 print()
 print("================= Find best f1 from score: normalization loss ... =================")
-info,test_scores,predict = get_final_result(test_pred_results, test_ae_results,  test_generate_results, y_test_labels, topk = 1, option = 2, method="sum", alpha =args.test_alpha, beta=args.test_beta, gamma = args.test_gamma, search_steps=args.search_steps)
-#info = get_final_result_POT(test_pred_results, test_ae_results, test_generate_results, train_pred_results, train_ae_results, train_generate_results, y_test_labels, topk = 1, option = 2, method="sum", alpha =args.test_alpha, beta=args.test_beta, gamma = args.test_gamma, search_steps=args.search_steps)
+info, test_scores, predict = get_final_result(test_pred_results, test_ae_results, test_generate_results, y_test_labels,
+                                              topk=1, option=2, method="sum",
+                                              alpha=args.test_alpha, beta=args.test_beta, gamma=args.test_gamma,
+                                              search_steps=args.search_steps)
 print(info)
-
 
 print()
 print("================= Find best f1 from score: normalization loss ... =================")
-info,test_scores,predict = get_final_result(test_pred_results, test_ae_results,  test_generate_results, y_test_labels, topk = 1, option = 2, method="mean", alpha =args.test_alpha, beta=args.test_beta, gamma = args.test_gamma, search_steps=args.search_steps)
-#info = get_final_result_POT(test_pred_results, test_ae_results, test_generate_results, train_pred_results, train_ae_results, train_generate_results, y_test_labels, topk = 1, option = 2, method="mean", alpha =args.test_alpha, beta=args.test_beta, gamma = args.test_gamma, search_steps=args.search_steps)
+info, test_scores, predict = get_final_result(test_pred_results, test_ae_results, test_generate_results, y_test_labels,
+                                              topk=1, option=2, method="mean",
+                                              alpha=args.test_alpha, beta=args.test_beta, gamma=args.test_gamma,
+                                              search_steps=args.search_steps)
 print(info)
-
-
-

@@ -1,36 +1,95 @@
-
 import pandas as pd
 from sklearn import preprocessing
 import numpy as np
 import torch
 
 from lib.utils import *
-#from utils import *
+
+def _read_csv_robust(path: str, sep=None) -> pd.DataFrame:
+    """Read CSV robustly across separators/engines and normalize column names."""
+    try:
+        df = pd.read_csv(path, sep=sep)
+    except Exception:
+        df = pd.read_csv(path, sep=None, engine="python")
+    df.columns = [str(c).strip() for c in df.columns]
+    # common: index column saved
+    unnamed_like = [c for c in df.columns if str(c).startswith("Unnamed:")]
+    if unnamed_like:
+        df = df.drop(columns=unnamed_like)
+    return df
+
+
+def _coerce_numeric_frame(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+    return df
+
+
+def _extract_wadi_label_and_drop(df: pd.DataFrame):
+    """Return (features_df, labels_array) for WADI test CSV."""
+    # Known label column names/variants
+    candidate_cols = [
+        "label",
+        "attack",
+        "Attack",
+        "Normal/Attack",
+        "Attack LABLE (1:No Attack, -1:Attack)",
+        "Attack  LABLE (1:No Attack, -1:Attack)",
+    ]
+    label_col = None
+    for c in candidate_cols:
+        if c in df.columns:
+            label_col = c
+            break
+    # Fallback: find a column that contains both attack and label/lable
+    if label_col is None:
+        for c in df.columns:
+            s = str(c).strip().lower()
+            if "attack" in s and ("label" in s or "lable" in s):
+                label_col = c
+                break
+    if label_col is None:
+        raise KeyError(
+            "Could not find WADI label column. Expected one of: "
+            f"{candidate_cols}. Available columns (first 30): {list(df.columns)[:30]}"
+        )
+
+    labels_raw = df[label_col]
+    df = df.drop(columns=[label_col])
+    # Drop non-sensor columns if present
+    df = df.drop(columns=["Row", "Date", "Time", "Date_Time", "Date time", "Timestamp"], errors="ignore")
+    labels_num = pd.to_numeric(labels_raw, errors="coerce").fillna(0).values
+    # Map common encodings:
+    # -1 => attack (anomaly)
+    #  1 => normal
+    #  0/1 => sometimes already binary
+    labels = (labels_num == -1).astype(float)
+    if labels.max() == 0 and np.isin(labels_num, [0, 1]).all():
+        labels = labels_num.astype(float)
+    return df, labels
+
 
 def preprocessTrainingData(file, sep=None, min_max_scaler = None, training = True):
     # === Normal period ====
-    normal = pd.read_csv(file, sep= sep)  # , nrows=1000)
+    normal = _read_csv_robust(file, sep=sep)
+    # Preprocessed wadi_train.csv may already have only sensors; be tolerant.
+    normal = normal.drop(columns=['Row', 'Date', 'Time', 'Date_Time', 'Date time', 'Timestamp', 'label', 'attack', 'Attack'], errors='ignore')
 
-    normal = normal.drop(['Row', 'Date', 'Time'], axis=1)
-
-    normal = normal.astype(float)
-
-    normal = normal.fillna(normal.mean())
+    normal = _coerce_numeric_frame(normal)
+    normal = normal.fillna(normal.mean(numeric_only=True))
     normal = normal.fillna(0)
 
     return normal.values, min_max_scaler
 
 def preprocessTestingData(file, sep=None, min_max_scaler = None, training=False):
     # === Normal period ====
-    attack = pd.read_csv(file, sep= sep)  # , nrows=1000)
+    attack = _read_csv_robust(file, sep=sep)
 
-    labels = attack["label"].values
-    attack = attack.drop(['Row', 'Date', 'Time', "Date_Time", "label"], axis=1)
+    attack, labels = _extract_wadi_label_and_drop(attack)
 
-    # Transform all columns into float64
-    attack = attack.astype(float)
-
-    attack = attack.fillna(attack.mean())
+    attack = _coerce_numeric_frame(attack)
+    attack = attack.fillna(attack.mean(numeric_only=True))
     attack = attack.fillna(0)
 
     return attack.values, labels
@@ -271,21 +330,22 @@ def load_data3(normal, attack, labels, device = "gpu", window_size = 12, val_rat
     # min = normal.min()##axis=0
     # max = normal.max()##axis=0
     # min_max_scaler = MinMaxScaler(min, max)
+    # normal = min_max_scaler.transform(normal)
 
     min_max_scaler = preprocessing.MinMaxScaler()
     normal = min_max_scaler.fit_transform(normal)
+
     attack = min_max_scaler.transform(attack)
 
     for i in range(len(window_sizes)):
         normal_mas[i] = min_max_scaler.transform(normal_mas[i])
         attack_mas[i] = min_max_scaler.transform(attack_mas[i])
-    
 
     windows_normal = normal[np.arange(window_size)[None, :] + np.arange(normal.shape[0] - window_size + 1)[:, None]]
-    
+    # print(windows_normal.shape)  # (494988, 12, 51)
 
     windows_attack = attack[np.arange(window_size)[None, :] + np.arange(attack.shape[0] - window_size + 1)[:, None]]
-    
+    # print(windows_attack.shape)  # (449907, 12, 51)
 
     for i in range(len(window_sizes)):
         normal_mas[i] = normal_mas[i][np.arange(window_size)[None, :] + np.arange(normal.shape[0] - window_size + 1)[:, None]]
@@ -456,6 +516,4 @@ def load_data_unsup_train(attack, labels, device = "gpu", window_size = 12, val_
     print("val: ", windows_val.shape)
 
     return train_loader, val_loader, min_max_scaler
-
-
 

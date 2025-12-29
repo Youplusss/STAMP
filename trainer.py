@@ -1,5 +1,3 @@
-
-
 import os
 import torch
 from lib.logger import get_logger
@@ -31,7 +29,7 @@ class Trainer(object):
 
         self.best_path = os.path.join(self.args.log_dir, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
         #self.best_path = os.path.join(self.args.log_dir, 'best_model_unsup_weights_init_' + self.args.data + "_" + self.args.model + '.pth') #用该版本读取无监督节点权重
-        self.transfer_path = os.path.join(self.args.log_dir_transfer, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
+        self.transfer_path = self.best_path
         self.loss_figure_path = os.path.join(self.args.log_dir, 'loss.png')
 
         ## log
@@ -338,7 +336,8 @@ class Tester(object):
     def testing(self, data_loader, map_location = None):
         if self.path != None:
             print("load model: ", self.path)
-            check_point = torch.load(self.path, map_location = map_location)
+            # PyTorch >=2.6 defaults weights_only=True; we need full checkpoint (includes argparse.Namespace).
+            check_point = torch.load(self.path, map_location=map_location, weights_only=False)
             pred_state_dict = check_point['pred_state_dict']
             ae_state_dict = check_point['ae_state_dict']
             # args = check_point['config']
@@ -391,12 +390,11 @@ class Tester(object):
                 generate_batch_out = self.ae(generate_batch)
 
 
-                loss1 = torch.mean((output.reshape(-1,pred_channels) - target.reshape(-1,pred_channels)) ** 2, axis=1)##axis=(1,2,3)
-                loss2 = torch.mean((output1 - target1) ** 2, axis=1)
-                loss3 = torch.mean((generate_batch - generate_batch_out) ** 2, axis=1)
+                loss1 = torch.mean((output.reshape(-1,pred_channels) - target.reshape(-1,pred_channels)) ** 2, dim=1)  ## (batch_size,)
+                loss2 = torch.mean((output1 - target1) ** 2, dim=1)
+                loss3 = torch.mean((generate_batch - generate_batch_out) ** 2, dim=1)
 
                 score = self.alpha * loss1 + self.beta * loss2 + self.gamma * loss3#(batch_size)
-                # score = self.alpha * torch.mean((predmodel_gt - pred_out) ** 2, axis=1) + self.beta * torch.mean((x2 - x2_) ** 2, axis=1)
                 scores.append(score.detach().cpu().numpy())
 
 
@@ -635,7 +633,7 @@ class PredTester(object):
                     target = self.scaler.inverse_transform(target.reshape(-1, self.args.n_pred,self.args.nnodes * self.args.out_channels).detach().cpu().numpy())
                     target = torch.from_numpy(target).float().view(-1, self.args.n_pred, self.args.nnodes,self.args.out_channels).to(batch.device)
 
-                score = torch.mean((output.reshape(-1,pred_channels) - target.reshape(-1,pred_channels)) ** 2, axis=1)##axis=(1,2,3)
+                score = torch.mean((output.reshape(-1,pred_channels) - target.reshape(-1,pred_channels)) ** 2, dim=1)  ## (batch_size)
 
                 scores.append(score.detach().cpu().numpy())
 
@@ -838,7 +836,7 @@ class AETester(object):
                     batch = self.scaler.inverse_transform(batch.reshape(-1, self.args.window_size,self.args.nnodes * self.args.out_channels).detach().cpu().numpy())
                     batch = torch.from_numpy(batch).float().view(-1, self.args.window_size, self.args.nnodes,self.args.out_channels).to(batch.device)
 
-                score = torch.mean((output.reshape(-1, ae_channels) - batch.reshape(-1, ae_channels)) ** 2, axis=1)##axis=(1,2,3)
+                score = torch.mean((output.reshape(-1, ae_channels) - batch.reshape(-1, ae_channels)) ** 2, dim=1)  ## (batch_size)
 
                 scores.append(score.detach().cpu().numpy())
 

@@ -40,33 +40,84 @@ def downsample(data, labels, down_len):
     return d_data.tolist(), d_labels.tolist()
 
 
+def _coerce_numeric_df(df: pd.DataFrame) -> pd.DataFrame:
+    """Convert all columns to numeric when possible; non-convertible values become NaN."""
+    df = df.copy()
+    for c in df.columns:
+        df[c] = pd.to_numeric(df[c], errors='coerce')
+    return df
+
+
+def _fillna_with_column_means(df: pd.DataFrame) -> pd.DataFrame:
+    """Fill NaNs using per-column means (numeric-only) and finally fill remaining NaNs with 0."""
+    df = df.copy()
+    means = df.mean(numeric_only=True)
+    df = df.fillna(means)
+    df = df.fillna(0)
+    return df
+
+
 def main():
 
-    train = pd.read_csv('./WADI_14days.csv', index_col=0)
-    test = pd.read_csv('./WADI_attackdata_labelled.csv', index_col=0)
-    
+    # WADI raw CSVs often contain mixed dtypes; low_memory=False avoids chunked inference surprises.
+    train = pd.read_csv('./data/WADI/WADI_14days_new.csv', index_col=0, low_memory=False)
+    test = pd.read_csv('./data/WADI/WADI_attackdataLABLE.csv', index_col=0, header=1, low_memory=False)
 
-    train = train.iloc[:, 2:]
+
+    train = train.iloc[:, 3:]
     test = test.iloc[:, 3:]
 
-
-    train = train.fillna(train.mean())
-    test = test.fillna(test.mean())
-    train = train.fillna(0)
-    test = test.fillna(0)
+    # (debug) uncomment to inspect columns
+    # print(len(test.columns), test.columns)
 
     # trim column names
-    train = train.rename(columns=lambda x: x.strip())
-    test = test.rename(columns=lambda x: x.strip())
+    train = train.rename(columns=lambda x: str(x).strip())
+    test = test.rename(columns=lambda x: str(x).strip())
 
+    # normalize label column name to 'attack' if present
+    def _is_attack_label_col(col) -> bool:
+        s = str(col).strip()
+        s_norm = re.sub(r"\s+", " ", s).lower()
+        # fast path: your file prints exactly this
+        if s_norm == "attack lable (1:no attack, -1:attack)":
+            return True
+        # robust path: contains words
+        return ("attack" in s_norm) and ("lable" in s_norm or "label" in s_norm) and ("no attack" in s_norm)
+
+    test = test.rename(columns=lambda x: 'attack' if _is_attack_label_col(x) else str(x).strip())
+
+    # Fallback: if for any reason the rename didn't hit (e.g., header quirks), find the column explicitly.
+    if 'attack' not in test.columns:
+        for c in list(test.columns):
+            if _is_attack_label_col(c):
+                test = test.rename(columns={c: 'attack'})
+                break
+
+    # (debug) uncomment to inspect columns after renaming
+    # print(len(test.columns), test.columns)
+
+    # keep only numeric sensor columns; coerce anything weird to NaN
+    # (we'll handle the label column separately)
+    if 'attack' in test.columns:
+        test_labels_raw = test['attack']
+        test = test.drop(columns=['attack'])
+    else:
+        raise KeyError("Could not find attack label column in WADI attack CSV after renaming")
+
+    train = _coerce_numeric_df(train)
+    test = _coerce_numeric_df(test)
+
+    train = _fillna_with_column_means(train)
+    test = _fillna_with_column_means(test)
 
     train_labels = np.zeros(len(train))
-    test_labels = test.attack
+    # WADI labels are commonly 1 for normal and -1 for attack.
+    # Convert to numeric then map: (-1 -> 1 anomaly) else 0.
+    test_labels_num = pd.to_numeric(test_labels_raw, errors='coerce').fillna(1).values
+    test_labels = (test_labels_num == -1).astype(float)
 
-    # train = train.drop(columns=['attack'])
-    test = test.drop(columns=['attack'])
-
-    cols = [x[46:] for x in train.columns] # remove column name prefixes
+    # remove column name prefixes (some WADI dumps use long prefixes)
+    cols = [str(x)[46:] if len(str(x)) > 46 else str(x) for x in train.columns]
     train.columns = cols
     test.columns = cols
 
@@ -92,10 +143,10 @@ def main():
 
     train_df = train_df.iloc[2160:]
 
-    train_df.to_csv('./swat_train.csv')
-    test_df.to_csv('./swat_test.csv')
+    train_df.to_csv('./dataset/WADI/wadi_train.csv')
+    test_df.to_csv('./dataset/WADI/wadi_test.csv')
 
-    f = open('./list.txt', 'w')
+    f = open('./dataset/WADI/list.txt', 'w')
     for col in train.columns:
         f.write(col+'\n')
     f.close()

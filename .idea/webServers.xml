@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project version="4">
+  <component name="WebServers">
+    <option name="servers">
+      <webServer id="813992f2-f937-48ac-9ab3-df0a9bf17c66" name="STAMP">
+        <fileTransfer rootFolder="/home/youwenlong/code/STAMP" accessType="SFTP" host="222.20.97.15" port="22" sshConfigId="e330044c-82dd-4d6b-ae3b-e3664305311f" sshConfig="N-3090">
+          <advancedOptions>
+            <advancedOptions dataProtectionLevel="Private" passiveMode="true" shareSSLContext="true" />
+          </advancedOptions>
+        </fileTransfer>
+      </webServer>
+    </option>
+  </component>
+</project>

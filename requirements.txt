@@ -5,13 +5,12 @@ scikit-learn==1.1.2
 scipy==1.9.0
 tensorly==0.7.0
 tomli==2.0.1
-torch
+#torch
 tqdm==4.64.0
 networkx==2.8.6
 pyod
 pysnooper
-datetime
 xgboost
 lightgbm
-pickle
-shap
+shap==0.49.1
+

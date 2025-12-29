@@ -40,12 +40,12 @@ def downsample(data, labels, down_len):
 
 def main():
 
-    test = pd.read_csv('./swat_test.csv', index_col=0)
-    train = pd.read_csv('./swat_train.csv', index_col=0)
+    test = pd.read_csv('./data/SWaT/swat2.csv', index_col=0)
+    train = pd.read_csv('./data/SWaT/swat_train2.csv', index_col=0)
 
 
-    test = test.iloc[:, 1:]
-    train = train.iloc[:, 1:]
+    test = test.iloc[:, :]
+    train = train.iloc[:, :]
 
     train = train.fillna(train.mean())
     test = test.fillna(test.mean())
@@ -58,6 +58,10 @@ def main():
 
     # print(len(test.columns),test.columns)
     # print(len(train.columns),train.columns)
+
+    # 将train和test中的列“Normal/Attack”重命名为 "attack"
+    train = train.rename(columns=lambda x: 'attack' if re.match(r'Normal/Attack', x) else x)
+    test = test.rename(columns=lambda x: 'attack' if re.match(r'Normal/Attack', x) else x)
 
 
     train_labels = train.attack
@@ -89,10 +93,10 @@ def main():
     # print(train_df.values.shape)
     # print(test_df.values.shape)
 
-    train_df.to_csv('./swat_train.csv')
-    test_df.to_csv('./swat_test.csv')
+    train_df.to_csv('./dataset/SWaT/swat_train.csv', index=False)
+    test_df.to_csv('./dataset/SWaT/swat_test.csv', index=False)
 
-    f = open('./list.txt', 'w')
+    f = open('./dataset/SWaT/list.txt', 'w')
     for col in train.columns:
         f.write(col+'\n')
     f.close()
