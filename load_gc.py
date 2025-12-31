@@ -118,8 +118,8 @@ args.device = DEVICE
 
 base_dir = os.getcwd()
 
-train_filename = base_dir + "/data/" + args.data + "/SWaT_Dataset_normal.csv"
-test_filename = base_dir + "/data/" + args.data + "/SWaT_Dataset_attack.csv"
+train_filename = base_dir + "/dataset/" + args.data + "/swat_train.csv"
+test_filename = base_dir + "/dataset/" + args.data + "/swat_test.csv"
 
 if args.is_mas:
     train_loader, val_loader, test_loader, y_test_labels, min_max_scaler = load_data2(args.data,

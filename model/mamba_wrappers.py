@@ -77,7 +77,7 @@ class ReconMambaConfig:
     d_conv: int = 4
     expand: int = 2
     dropout: float = 0.1
-    output_activation: str = "none"  # 'none' | 'sigmoid' | 'tanh'
+    output_activation: str = "auto"  # 'auto' | 'none' | 'sigmoid' | 'tanh'
 
 
 class STAMPForecastMamba(nn.Module):
@@ -239,8 +239,9 @@ class STAMPReconMamba(nn.Module):
         )
 
         act = cfg.output_activation.lower()
-        if act not in {"none", "sigmoid", "tanh"}:
-            raise ValueError("output_activation 仅支持 none/sigmoid/tanh")
+        if act not in {"auto", "none", "sigmoid", "tanh"}:
+            raise ValueError("output_activation 仅支持 auto/none/sigmoid/tanh")
+        # auto: 默认根据数据缩放选择；若未在 build 函数里解析，这里退化为 sigmoid（适用于 MinMaxScaler 到 [0,1] 的场景）
         self.output_activation = act
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -268,7 +269,7 @@ class STAMPReconMamba(nn.Module):
         out = self.core(x_seq)
         recon = out["recon"]  # [B,T,D]
 
-        if self.output_activation == "sigmoid":
+        if self.output_activation in {"sigmoid", "auto"}:
             recon = torch.sigmoid(recon)
         elif self.output_activation == "tanh":
             recon = torch.tanh(recon)
@@ -304,6 +305,17 @@ def build_stamp_mamba_models(args) -> tuple[nn.Module, nn.Module]:
     )
 
     recon_layers_str = getattr(args, "recon_num_layers", "2,2,2")
+    # --- 关键修复：输出激活/范围约束 ---
+    # 由于 STAMP 的各数据集 dataloader 默认使用 MinMaxScaler，把数据缩放到 [0,1]。
+    # 若重构分支输出不做约束，在对抗项 ( -adv_loss ) 作用下非常容易把输出推到极大，导致 MSE 爆炸。
+    out_act = getattr(args, "recon_output_activation", "auto")
+    if out_act is None:
+        out_act = "auto"
+    out_act = str(out_act).lower()
+    if out_act == "auto":
+        # real_value=True 表示在原始数值空间训练/评估，此时不应强行 sigmoid
+        out_act = "none" if bool(getattr(args, "real_value", False)) else "sigmoid"
+
     r_cfg = ReconMambaConfig(
         d_model=getattr(args, "recon_d_model", 256),
         num_layers=_parse_int_tuple(recon_layers_str, expected_len=3),
@@ -311,7 +323,7 @@ def build_stamp_mamba_models(args) -> tuple[nn.Module, nn.Module]:
         d_conv=getattr(args, "recon_d_conv", 4),
         expand=getattr(args, "recon_expand", 2),
         dropout=getattr(args, "recon_dropout", 0.1),
-        output_activation=getattr(args, "recon_output_activation", "none"),
+        output_activation=out_act,
     )
 
     ae_model = STAMPReconMamba(

@@ -30,6 +30,13 @@
           </mappings>
         </serverdata>
       </paths>
+      <paths name="N-3090 (2)">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
+        </serverdata>
+      </paths>
       <paths name="STAMP">
         <serverdata>
           <mappings>
@@ -38,6 +45,7 @@
           <excludedPaths>
             <excludedPath path="/data" />
             <excludedPath path="/dataset" />
+            <excludedPath path="/tmp" />
           </excludedPaths>
         </serverdata>
       </paths>

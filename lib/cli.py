@@ -1,5 +1,8 @@
 import argparse
 
+# CLI_VERSION 用于快速判断远端代码是否更新到包含 recon_model 的版本
+CLI_VERSION = "2025-12-29-recon-model"
+
 
 def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add CLI arguments shared by train/test and sup/unsup entrypoints."""
@@ -11,16 +14,25 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument('--train_file', type=str, default=None, help='override train file path (csv datasets)')
     parser.add_argument('--test_file', type=str, default=None, help='override test file path (csv datasets)')
     parser.add_argument('--group_name', type=str, default=None, help='SMD subset name, e.g. machine-1-1')
+    # tmp/ 版本里常用 --group，这里做兼容别名（finalize_args 会自动映射）
+    parser.add_argument('--group', type=str, default=None, help='(alias) same as --group_name')
 
     # Runtime
     parser.add_argument('--debug', default=False, type=eval)
     parser.add_argument('--real_value', default=False, type=eval)
     parser.add_argument('--log_dir', default="expe", type=str)
+    # 兼容 Trainer.transfer_path（可选）
+    parser.add_argument('--log_dir_transfer', default=None, type=str,
+                        help='(optional) transfer checkpoint dir; default=log_dir')
     parser.add_argument('--gpu_id', default="0", type=str)
 
     # Model choice
     parser.add_argument('--model', default="v2_", type=str)
+    # pred_model: gat | mamba
     parser.add_argument('--pred_model', default="gat", type=str)
+    # recon_model: ae | mamba
+    parser.add_argument('--recon_model', default="ae", type=str,
+                        help='reconstruction branch type: ae | mamba')
     parser.add_argument('--temp_method', default="SAttn", type=str)
 
     # Graph
@@ -90,6 +102,58 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     parser.add_argument('--is_graph', default=True, type=eval)
     parser.add_argument('--is_mas', default=True, type=eval)
 
+    # Coupled/adv training behavior
+    parser.add_argument('--adv_freeze_other', type=eval, default=True,
+                        help='freeze the other branch during adversarial/coupled update to save memory')
+
+    # ---- Stabilized adversarial training (recommended for Mamba models) ----
+    parser.add_argument('--adv_mode', type=str, default='hinge', choices=['hinge', 'exp', 'legacy'],
+                        help='Adversarial objective for AE. hinge: bounded hinge penalty (recommended). exp: exp(-adv/tau). legacy: ae_loss - lambda*adv_loss (can diverge).')
+    parser.add_argument('--adv_margin', type=float, default=0.1,
+                        help='Margin for hinge adversarial penalty: encourage adv_loss >= ae_loss + margin.')
+    parser.add_argument('--adv_tau', type=float, default=1.0,
+                        help='Temperature for exp adversarial penalty exp(-adv/tau).')
+    parser.add_argument('--adv_lambda_pred', type=float, default=0.5,
+                        help='Max weight for adv loss in pred model update (after warmup+ramp).')
+    parser.add_argument('--adv_lambda_ae', type=float, default=1.0,
+                        help='Max weight for adversarial penalty in AE update (after warmup+ramp).')
+    parser.add_argument('--adv_warmup_epochs', type=int, default=1,
+                        help='Warmup epochs before enabling adversarial coupling.')
+    parser.add_argument('--adv_ramp_epochs', type=int, default=5,
+                        help='Ramp epochs to linearly increase adversarial weights after warmup.')
+    parser.add_argument('--clip_grad_norm_pred', type=float, default=1.0,
+                        help='Gradient clipping (L2 norm) for prediction model. Set 0 to disable.')
+    parser.add_argument('--clip_grad_norm_ae', type=float, default=1.0,
+                        help='Gradient clipping (L2 norm) for reconstruction model. Set 0 to disable.')
+    parser.add_argument('--pred_weight_decay', type=float, default=1e-4,
+                        help='Weight decay for prediction model optimizer.')
+    parser.add_argument('--ae_weight_decay', type=float, default=1e-4,
+                        help='Weight decay for reconstruction model optimizer.')
+
+
+    # -------------------------- Mamba Forecast params --------------------------
+    parser.add_argument('--mamba_use_mas', default=True, type=eval,
+                        help='(only for pred_model=mamba) whether to use MAS channels as extra tokens')
+    parser.add_argument('--mamba_d_model', type=int, default=256)
+    parser.add_argument('--mamba_e_layers', type=int, default=3)
+    parser.add_argument('--mamba_d_state', type=int, default=16)
+    parser.add_argument('--mamba_d_conv', type=int, default=4)
+    parser.add_argument('--mamba_expand', type=int, default=2)
+    parser.add_argument('--mamba_dropout', type=float, default=0.1)
+    parser.add_argument('--mamba_use_norm', default=True, type=eval)
+    parser.add_argument('--mamba_use_last_residual', default=True, type=eval)
+
+    # -------------------------- Mamba Recon params --------------------------
+    parser.add_argument('--recon_d_model', type=int, default=256)
+    parser.add_argument('--recon_num_layers', type=str, default='2,2,2',
+                        help="e.g. '2,2,2' for [local, mid, global] layers")
+    parser.add_argument('--recon_d_state', type=int, default=16)
+    parser.add_argument('--recon_d_conv', type=int, default=4)
+    parser.add_argument('--recon_expand', type=int, default=2)
+    parser.add_argument('--recon_dropout', type=float, default=0.1)
+    parser.add_argument('--recon_output_activation', type=str, default='none',
+                        help='none | sigmoid | tanh')
+
     return parser
 
 
@@ -97,6 +161,16 @@ def finalize_args(args):
     """Normalize/patch args for backward compatibility."""
     if getattr(args, "epoch", None) is not None:
         args.epochs = args.epoch
+
+    # alias: --group -> --group_name
+    if getattr(args, 'group_name', None) is None and getattr(args, 'group', None) is not None:
+        args.group_name = args.group
+
+    # For Mamba backbones, lr=1e-3 often diverges; use a safer default unless overridden.
+    if getattr(args, 'pred_model', None) == 'mamba' and abs(float(args.pred_lr_init) - 1e-3) < 1e-12:
+        args.pred_lr_init = 3e-4
+    if getattr(args, 'recon_model', None) == 'mamba' and abs(float(args.ae_lr_init) - 1e-3) < 1e-12:
+        args.ae_lr_init = 3e-4
+
     args.model = args.model + args.pred_model
     return args
-
