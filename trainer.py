@@ -50,7 +50,7 @@ class Trainer(object):
         ## log
         if os.path.isdir(args.log_dir) == False and not args.debug:
             os.makedirs(args.log_dir, exist_ok=True)
-        self.logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data = args.data)
+        self.logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data, tag='train')
         # self.logger = get_logger(args.log_dir, name=args.model + '_unsup', debug=args.debug, data = args.data)
         self.logger.info('Experiment log path in: {}'.format(args.log_dir))
 
@@ -422,6 +422,10 @@ class Trainer(object):
         ----
         path: str | None
             保存路径。若为 None，则默认保存到 self.best_path。
+
+        说明
+        ----
+        为避免训练被中断/并发写入导致 .pth 文件损坏，这里使用“临时文件 + 原子替换”。
         """
         if path is None:
             path = self.best_path
@@ -433,7 +437,11 @@ class Trainer(object):
             'ae_optimizer': self.ae_optimizer.state_dict(),
             'config': self.args,
         }
-        torch.save(state, path)
+
+        # atomic save: write to temp then replace
+        tmp_path = str(path) + ".tmp"
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, path)
         self.logger.info("Saving model checkpoint to " + str(path))
 
     def save_checkpoint_transfer(self):
@@ -446,7 +454,9 @@ class Trainer(object):
 
             'config': self.args
         }
-        torch.save(state, self.transfer_path)
+        tmp_path = str(self.transfer_path) + ".tmp"
+        torch.save(state, tmp_path)
+        os.replace(tmp_path, self.transfer_path)
         self.logger.info("Saving current best transfer model to " + self.transfer_path)
 
 
@@ -591,7 +601,7 @@ class PredictedModelTrainer(object):
         ## log
         if os.path.isdir(args.log_dir) == False and not args.debug:
             os.makedirs(args.log_dir, exist_ok=True)
-        self.logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data)
+        self.logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data, tag='train')
         self.logger.info('Experiment log path in: {}'.format(args.log_dir))
 
     def pred_model_batch(self, batch, training=True, mas=None):

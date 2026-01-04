@@ -42,6 +42,15 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--hidden_dim', type=int, default=32)
     parser.add_argument('--att_option', type=int, default=1)
 
+    # -------------------------- attention params (STAMP-GAT) --------------------------
+    # These are required by model.net.STATModel and exist in run.py; keep defaults consistent for compatibility.
+    parser.add_argument('--embed_size', type=int, default=64, help='embed_size (for temporal/spatial attention in STAMP-GAT)')
+    parser.add_argument('--num_heads', type=int, default=8, help='num_heads (for MultiheadAttention)')
+    parser.add_argument('--num_layers', type=int, default=1, help='num_attn_layers')
+    parser.add_argument('--ffwd_size', type=int, default=32, help='ffwd_size')
+    parser.add_argument('--is_conv', type=eval, default=False, help='whether to use conv FFN in TransformerEncoder')
+    parser.add_argument('--return_weight', type=eval, default=False, help='whether to return attention weights (if supported)')
+
     # -------------------------- sequence params --------------------------
     parser.add_argument('--window_size', type=int, default=15)
     parser.add_argument('--n_pred', type=int, default=3)
@@ -69,7 +78,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--test_topk_agg', type=str, default='sum', choices=['sum', 'mean', 'max'], help='how to aggregate the top-K node scores')
     parser.add_argument('--search_steps', default=50, type=int)
 
-    parser.add_argument('--is_down_sample', type=eval, default=False)
+    parser.add_argument('--is_down_sample', type=eval, default=True)
     parser.add_argument('--down_len', type=int, default=100)
 
     parser.add_argument('--is_mas', default=True, type=eval)
@@ -308,7 +317,7 @@ def main():
         ae_model = EncoderDecoder(AE_IN_CHANNELS, latent_size, AE_IN_CHANNELS, not args.real_value)
 
     # logger
-    logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data)
+    logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data, tag='test')
 
     # checkpoint path
     model_path = os.path.join(args.log_dir, 'best_model_' + args.data + "_" + args.model + '.pth')

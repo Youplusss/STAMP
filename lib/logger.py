@@ -2,34 +2,61 @@ import os
 import logging
 from datetime import datetime
 
-def get_logger(root, name=None, debug=True, data = "swat"):
-    #when debug is true, show DEBUG and INFO in screen
-    #when debug is false, show DEBUG in file and info in both screen&file
-    #INFO will always be in screen
-    # create a logger
+
+def get_logger(root, name=None, debug=True, data="swat", tag: str = "run"):
+    """Create a logger that always logs to file and console.
+
+    Parameters
+    ----------
+    root:
+        Log directory.
+    name:
+        Logger name.
+    debug:
+        If True, console shows DEBUG; else INFO.
+    data:
+        Dataset name used in filename.
+    tag:
+        A suffix to separate logs, e.g. 'train' / 'test'.
+
+    Previous behavior only wrote to file when debug=False, which explains why
+    many *_run.log files stayed empty.
+
+    This version:
+    - Always writes DEBUG-level logs to <root>/<data>_<tag>.log.
+    - Writes DEBUG/INFO to console depending on debug.
+    - Avoids accumulating duplicate handlers across multiple calls.
+    """
+
+    os.makedirs(root, exist_ok=True)
+
     logger = logging.getLogger(name)
-    #critical > error > warning > info > debug > notset
     logger.setLevel(logging.DEBUG)
 
-    # define the formate
+    # Avoid duplicate handlers when get_logger is called multiple times
+    if getattr(logger, "_stamp_configured", False):
+        return logger
+
     formatter = logging.Formatter('%(asctime)s: %(message)s', "%Y-%m-%d %H:%M")
-    # create another handler for output log to console
+
+    # Console handler
     console_handler = logging.StreamHandler()
-    if debug:
-        console_handler.setLevel(logging.DEBUG)
-    else:
-        console_handler.setLevel(logging.INFO)
-        # create a handler for write log to file
-        logfile = os.path.join(root, data+'_run.log')
-        print('Creat Log File in: ', logfile)
-        file_handler = logging.FileHandler(logfile, mode='w')
-        file_handler.setLevel(logging.DEBUG)
-        file_handler.setFormatter(formatter)
+    console_handler.setLevel(logging.DEBUG if debug else logging.INFO)
     console_handler.setFormatter(formatter)
-    # add Handler to logger
+
+    # File handler (always on)
+    safe_tag = str(tag or "run").strip() or "run"
+    logfile = os.path.join(root, f"{data}_{safe_tag}.log")
+    print('Creat Log File in: ', logfile)
+    file_handler = logging.FileHandler(logfile, mode='a', encoding='utf-8')
+    file_handler.setLevel(logging.DEBUG)
+    file_handler.setFormatter(formatter)
+
     logger.addHandler(console_handler)
-    if not debug:
-        logger.addHandler(file_handler)
+    logger.addHandler(file_handler)
+
+    logger.propagate = False
+    logger._stamp_configured = True
     return logger
 
 
