@@ -76,6 +76,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--batch_size', type=int, default=8, help='batch size')
     parser.add_argument('--epochs', type=int, default=30, help='number of epoch')
 
+    # Whether to use the coupled/adversarial objectives (loss1/loss2) in addition to plain pred_loss/ae_loss.
+    # For some models (notably mamba recon), the adversarial terms can destabilize training after a few epochs.
+    parser.add_argument('--use_adv', default=True, type=eval,
+                        help='use coupled/adversarial training objectives (default True; set False for stable mamba-mamba)')
+
     parser.add_argument('--is_down_sample', type=eval, default=True, help='down-sample raw series or not')
     parser.add_argument('--down_len', type=int, default=100, help='down sample ratio')
 
@@ -290,19 +295,29 @@ def main():
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    # 名称：v2_mamba / v2_gat...
+    # Name: v2_mamba / v2_gat...
     args.model = args.model + args.pred_model
+
+    # Resolve experiment directories
+    from lib.paths import resolve_experiment_dirs
+    exp = resolve_experiment_dirs(args.log_dir)
+    args.run_id = exp.run_id
+    args.log_dir = exp.root
+    args.log_dir_transfer = exp.root
+    args.log_dir_log = exp.log_dir
+    args.log_dir_pth = exp.pth_dir
+    args.log_dir_pdf = exp.pdf_dir
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
 
     from lib.utils import get_default_device, to_device, plot_history, plot_history2
     from lib.metrics import masked_mse_loss
+    from lib.logger import get_logger, log_hparams
     from model.utils import print_model_parameters, init_seed
 
     # device
     print(torch.cuda.is_available())
     device = get_default_device()
-    # make device accessible to Trainer/Tester
     args.device = device
 
     # load data
@@ -310,17 +325,6 @@ def main():
 
     # infer shape
     infer_and_override_data_shape(args, train_loader)
-
-    if args.in_channels != args.out_channels:
-        msg = (
-            "For STAMP-style generate_batch concat, require in_channels==out_channels, "
-            + "got "
-            + str(args.in_channels)
-            + " vs "
-            + str(args.out_channels)
-            + "."
-        )
-        raise ValueError(msg)
 
     # seed
     init_seed(args.seed)
@@ -363,7 +367,20 @@ def main():
     pred_loss = masked_mse_loss(mask_value=-0.01)
     ae_loss = masked_mse_loss(mask_value=-0.01)
 
-    # print params
+    # logger (file only; keep tqdm progress on console)
+    logger = get_logger(
+        exp.log_dir,
+        name=args.model,
+        debug=args.debug,
+        data=args.data,
+        tag='train',
+        model=args.model,
+        run_id=exp.run_id,
+        console=True,
+    )
+    log_hparams(logger, args)
+
+    # print params (parameter dump is kept as requested)
     print_model_parameters(pred_model)
     print_model_parameters(ae_model)
 
@@ -386,9 +403,10 @@ def main():
 
     train_history, val_history = trainer.train()
 
-    plot_history(train_history, model=args.model, mode="train", data=args.data)
-    plot_history(val_history, model=args.model, mode="val", data=args.data)
-    plot_history2(val_history, model=args.model, mode="val", data=args.data)
+    # plots -> expe/pdf
+    plot_history(train_history, model=args.model, mode="train", data=args.data, out_dir=exp.pdf_dir, show=False)
+    plot_history(val_history, model=args.model, mode="val", data=args.data, out_dir=exp.pdf_dir, show=False)
+    plot_history2(val_history, model=args.model, mode="val", data=args.data, out_dir=exp.pdf_dir, show=False)
 
 
 if __name__ == '__main__':

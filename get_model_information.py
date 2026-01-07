@@ -94,9 +94,26 @@ trainer = Trainer(pred_model, pred_loss, pred_optimizer, ae_model, ae_loss, ae_o
 train_history, val_history = trainer.train()
 
 
-model_path = os.path.join(args.log_dir, 'best_model_' + args.data + "_" + args.model + '.pth')
-logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data = args.data)
-tester = Tester(pred_model, ae_model, args, min_max_scaler, logger, path = model_path, alpha=args.test_alpha, beta=args.test_beta, gamma= args.test_gamma)
+from lib.paths import resolve_experiment_dirs
+
+# resolve experiment dirs early
+exp = resolve_experiment_dirs(getattr(args, 'log_dir', 'expe'))
+args.run_id = exp.run_id
+args.log_dir = exp.root
+args.log_dir_log = exp.log_dir
+args.log_dir_pth = exp.pth_dir
+args.log_dir_pdf = exp.pdf_dir
+
+# logger
+from lib.logger import get_logger, log_hparams
+logger = get_logger(exp.log_dir, name=args.model, debug=args.debug, data=args.data, tag='info', model=args.model, run_id=args.run_id, console=True)
+log_hparams(logger, args)
+
+# checkpoint path
+model_path = os.path.join(exp.pth_dir, 'best_model_' + args.data + "_" + args.model + '.pth')
+
+
+tester = Tester(pred_model, ae_model, args, min_max_scaler, logger, path=model_path, alpha=args.test_alpha, beta=args.test_beta, gamma=args.test_gamma)
 
 map_location = torch.device(DEVICE)
 # map_location = lambda storage.cuda(0), loc: storage

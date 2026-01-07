@@ -1,62 +1,104 @@
 import os
 import logging
 from datetime import datetime
+from typing import Optional
 
 
-def get_logger(root, name=None, debug=True, data="swat", tag: str = "run"):
-    """Create a logger that always logs to file and console.
+class TqdmConsoleHandler(logging.StreamHandler):
+    """Console handler compatible with tqdm progress bars."""
 
-    Parameters
-    ----------
-    root:
-        Log directory.
-    name:
-        Logger name.
-    debug:
-        If True, console shows DEBUG; else INFO.
-    data:
-        Dataset name used in filename.
-    tag:
-        A suffix to separate logs, e.g. 'train' / 'test'.
+    def emit(self, record):
+        try:
+            from tqdm import tqdm
+            msg = self.format(record)
+            tqdm.write(msg)
+        except Exception:
+            super().emit(record)
 
-    Previous behavior only wrote to file when debug=False, which explains why
-    many *_run.log files stayed empty.
 
-    This version:
-    - Always writes DEBUG-level logs to <root>/<data>_<tag>.log.
-    - Writes DEBUG/INFO to console depending on debug.
-    - Avoids accumulating duplicate handlers across multiple calls.
+def log_hparams(logger: logging.Logger, args, keys: Optional[list[str]] = None) -> None:
+    """Log a compact hyperparameter summary.
+
+    We keep it readable and stable across runs; by default we log a curated subset.
+    """
+    try:
+        d = vars(args)
+    except Exception:
+        d = {}
+
+    keys = keys or [
+        'data', 'model', 'pred_model', 'recon_model',
+        'pred_lr_init', 'ae_lr_init',
+        'batch_size', 'epochs',
+        'is_down_sample', 'down_len',
+        'is_mas', 'mamba_use_mas',
+        'use_adv', 'adv_freeze_other',
+        'grad_clip', 'max_grad_norm',
+        'seed', 'gpu_id',
+    ]
+
+    lines = []
+    for k in keys:
+        if k in d:
+            lines.append(f"- {k}: {d.get(k)}")
+
+    logger.info("[Hyperparameters]\n" + "\n".join(lines))
+
+
+def get_logger(
+    root: str,
+    name: Optional[str] = None,
+    debug: bool = True,
+    data: str = "swat",
+    tag: str = "run",
+    *,
+    model: Optional[str] = None,
+    run_id: Optional[str] = None,
+    console: bool = True,
+) -> logging.Logger:
+    """Create a logger that logs to file and optionally to console (tqdm-friendly).
+
+    Log file name includes time, dataset and model to distinguish runs:
+      <root>/<YYYYmmdd_HHMMSS>_<DATA>_<MODEL>_<TAG>.log
     """
 
     os.makedirs(root, exist_ok=True)
 
-    logger = logging.getLogger(name)
+    logger = logging.getLogger(name or f"stamp.{data}.{tag}")
     logger.setLevel(logging.DEBUG)
 
-    # Avoid duplicate handlers when get_logger is called multiple times
+    # Reset handlers on each call to avoid cross-run contamination
     if getattr(logger, "_stamp_configured", False):
         return logger
 
     formatter = logging.Formatter('%(asctime)s: %(message)s', "%Y-%m-%d %H:%M")
 
-    # Console handler
-    console_handler = logging.StreamHandler()
-    console_handler.setLevel(logging.DEBUG if debug else logging.INFO)
-    console_handler.setFormatter(formatter)
-
     # File handler (always on)
     safe_tag = str(tag or "run").strip() or "run"
-    logfile = os.path.join(root, f"{data}_{safe_tag}.log")
-    print('Creat Log File in: ', logfile)
+    safe_data = str(data or "data").strip()
+    safe_model = str(model or name or "model").strip()
+    rid = run_id or datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    logfile = os.path.join(root, f"{rid}_{safe_data}_{safe_model}_{safe_tag}.log")
     file_handler = logging.FileHandler(logfile, mode='a', encoding='utf-8')
     file_handler.setLevel(logging.DEBUG)
     file_handler.setFormatter(formatter)
 
-    logger.addHandler(console_handler)
     logger.addHandler(file_handler)
+
+    # Console handler (optional)
+    if console:
+        console_handler = TqdmConsoleHandler()
+        console_handler.setLevel(logging.DEBUG if debug else logging.INFO)
+        console_handler.setFormatter(formatter)
+        logger.addHandler(console_handler)
 
     logger.propagate = False
     logger._stamp_configured = True
+
+    # Expose log path for other tooling
+    logger.logfile = logfile
+
     return logger
 
 

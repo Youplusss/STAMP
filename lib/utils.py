@@ -22,7 +22,7 @@ def to_device(data, device):
         return [to_device(x, device) for x in data]
     return data.to(device, non_blocking=True)
     
-def plot_history(history, model = "gat", mode = "train", data="swat"):
+def plot_history(history, model = "gat", mode = "train", data="swat", out_dir: str | None = None, show: bool = False):
     fig = plt.figure()
     losses1 = [x[mode + '_loss1'] for x in history]
     losses2 = [x[mode + '_loss2'] for x in history]
@@ -33,11 +33,14 @@ def plot_history(history, model = "gat", mode = "train", data="swat"):
     plt.legend()
     plt.title('Losses vs. No. of epochs')
     plt.grid()
-    plt.savefig(base_dir + "/" + data + "_" + model + "_"+ mode + "_history.pdf", dpi=200, bbox_inches="tight")
-    plt.show()
+    out_dir = out_dir or base_dir
+    os.makedirs(out_dir, exist_ok=True)
+    plt.savefig(os.path.join(out_dir, data + "_" + model + "_"+ mode + "_history.pdf"), dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
     plt.close(fig)
 
-def plot_history2(history, model = "gat", mode = "val",data="swat"):
+def plot_history2(history, model = "gat", mode = "val",data="swat", out_dir: str | None = None, show: bool = False):
     fig = plt.figure()
     losses1 = [x[mode + '_loss1'] for x in history]
     losses2 = [x[mode + '_loss2'] for x in history]
@@ -54,11 +57,15 @@ def plot_history2(history, model = "gat", mode = "val",data="swat"):
     plt.legend()
     plt.title('Losses vs. No. of epochs')
     plt.grid()
-    plt.savefig(base_dir + "/" + data + "_" + model +"_"+ mode  + "_losses_history.pdf", dpi=200, bbox_inches="tight")
-    plt.show()
+    out_dir = out_dir or base_dir
+    os.makedirs(out_dir, exist_ok=True)
+    plt.savefig(os.path.join(out_dir, data + "_" + model +"_"+ mode  + "_losses_history.pdf"), dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
     plt.close(fig)
 
-def plot_history_pred(history, model = "gat",data="swat"):
+
+def plot_history_pred(history, model = "gat",data="swat", out_dir: str | None = None, show: bool = False):
     fig = plt.figure()
     train_loss = [x['train_loss'] for x in history]
     val_loss = [x['val_loss'] for x in history]
@@ -71,8 +78,11 @@ def plot_history_pred(history, model = "gat",data="swat"):
     plt.legend()
     plt.title('Losses vs. No. of epochs')
     plt.grid()
-    plt.savefig(base_dir + "/" + model +"_losses_history.pdf", dpi=200, bbox_inches="tight")
-    plt.show()
+    out_dir = out_dir or base_dir
+    os.makedirs(out_dir, exist_ok=True)
+    plt.savefig(os.path.join(out_dir, model +"_losses_history.pdf"), dpi=200, bbox_inches="tight")
+    if show:
+        plt.show()
     plt.close(fig)
     
 def histogram(y_test,y_pred):

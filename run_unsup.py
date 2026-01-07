@@ -191,6 +191,10 @@ trainer = Trainer(pred_model, pred_loss, pred_optimizer, ae_model, ae_loss, ae_o
 
 train_history, val_history = trainer.train()
 
-plot_history(train_history, model = args.model, mode="train", data=args.data)
-plot_history(val_history, model = args.model, mode="val", data=args.data)
+from lib.logger import get_logger, log_hparams
+logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=args.run_id, console=True)
+log_hparams(logger, args)
+
+plot_history(train_history, model=args.model, mode="train", data=args.data, out_dir=args.log_dir_pdf, show=False)
+plot_history(val_history, model=args.model, mode="val", data=args.data, out_dir=args.log_dir_pdf, show=False)
 plot_history2(val_history, model = args.model, mode="val", data=args.data)

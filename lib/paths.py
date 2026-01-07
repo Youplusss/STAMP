@@ -1,6 +1,7 @@
 import os
 from dataclasses import dataclass
 from typing import Optional
+from datetime import datetime
 
 
 @dataclass(frozen=True)
@@ -13,6 +14,25 @@ class DatasetPaths:
     test_csv: Optional[str] = None
     group_name: Optional[str] = None
     unsup_npz: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class ExperimentDirs:
+    """Standard output directories for a single run.
+
+    layout:
+      <root>/log  - text logs
+      <root>/pth  - checkpoints
+      <root>/pdf  - figures
+
+    run_id is a short timestamp used to disambiguate log filenames.
+    """
+
+    root: str
+    log_dir: str
+    pth_dir: str
+    pdf_dir: str
+    run_id: str
 
 
 def get_base_dir() -> str:
@@ -83,4 +103,35 @@ def resolve_dataset_paths(
         test_csv=test_csv,
         group_name=group_name,
         unsup_npz=unsup_npz,
+    )
+
+
+def resolve_experiment_dirs(root: str, *, run_id: Optional[str] = None) -> ExperimentDirs:
+    """Resolve and (if needed) create standard expe subdirectories.
+
+    Args:
+        root: usually 'expe'
+        run_id: optional; default is YYYYmmdd_HHMMSS
+
+    Returns:
+        ExperimentDirs
+    """
+    root = root or 'expe'
+    root = os.path.abspath(root)
+    log_dir = os.path.join(root, 'log')
+    pth_dir = os.path.join(root, 'pth')
+    pdf_dir = os.path.join(root, 'pdf')
+
+    os.makedirs(log_dir, exist_ok=True)
+    os.makedirs(pth_dir, exist_ok=True)
+    os.makedirs(pdf_dir, exist_ok=True)
+
+    rid = run_id or datetime.now().strftime('%Y%m%d_%H%M%S')
+
+    return ExperimentDirs(
+        root=root,
+        log_dir=log_dir,
+        pth_dir=pth_dir,
+        pdf_dir=pdf_dir,
+        run_id=rid,
     )

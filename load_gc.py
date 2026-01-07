@@ -1,4 +1,3 @@
-
 import os
 import argparse
 
@@ -99,13 +98,18 @@ parser.add_argument('--top_kErr', type=int, default=3,
                     help='top_kErr')
 args = parser.parse_args()
 
-args.model = args.model + args.pred_model
+from lib.paths import resolve_experiment_dirs
+exp = resolve_experiment_dirs(args.log_dir)
+args.run_id = exp.run_id
+args.log_dir = exp.root
+args.log_dir_log = exp.log_dir
+args.log_dir_pth = exp.pth_dir
 
 os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
 
 from model.net import *
 from trainer import Tester
-from lib.logger import get_logger
+from lib.logger import get_logger, log_hparams
 from lib.dataloader_msl_smap import load_data, load_data2
 from lib.utils import *
 from lib.metrics import *
@@ -157,9 +161,10 @@ ae_model = EncoderDecoder(AE_IN_CHANNELS, latent_size, AE_IN_CHANNELS, not args.
 # ae_model = to_device(ae_model, DEVICE)
 
 
-logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data)
+logger = get_logger(exp.log_dir, name=args.model, debug=args.debug, data=args.data, tag='run', model=args.model, run_id=exp.run_id, console=True)
+log_hparams(logger, args)
 
-model_path = "./expe/" + 'best_model_' + args.data + "_" + args.model + '.pth'
+model_path = os.path.join(exp.pth_dir, 'best_model_' + args.data + "_" + args.model + '.pth')
 tester = Tester(pred_model, ae_model, args, min_max_scaler, logger, path=model_path, alpha=args.test_alpha,
                 beta=args.test_beta, gamma=args.test_gamma)
 

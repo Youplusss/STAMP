@@ -46,7 +46,15 @@
             <excludedPath path="/data" />
             <excludedPath path="/dataset" />
             <excludedPath path="/tmp" />
+            <excludedPath path="/expe/pth" />
           </excludedPaths>
+        </serverdata>
+      </paths>
+      <paths name="Time-LLM">
+        <serverdata>
+          <mappings>
+            <mapping local="$PROJECT_DIR$" web="/" />
+          </mappings>
         </serverdata>
       </paths>
     </serverData>

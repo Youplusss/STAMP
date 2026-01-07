@@ -40,19 +40,25 @@ class Trainer(object):
         if val_loader != None:
             self.val_per_epoch = len(val_loader)
 
-        self.best_path = os.path.join(self.args.log_dir, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
-        # self.best_path = os.path.join(self.args.log_dir, 'best_model_unsup_weights_init_' + self.args.data + "_" + self.args.model + '.pth') #用该版本读取无监督节点权重
-        # log_dir_transfer 在原始仓库里并非所有脚本都显式定义，这里做兼容处理
+        # --- experiment dirs ---
+        # args.log_dir is the experiment root; optionally args.log_dir_pth/log_dir_log are injected by run.py.
+        pth_dir = getattr(self.args, 'log_dir_pth', None) or os.path.join(self.args.log_dir, 'pth')
+        os.makedirs(pth_dir, exist_ok=True)
+        self.best_path = os.path.join(pth_dir, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
+
         log_dir_transfer = getattr(self.args, 'log_dir_transfer', None) or self.args.log_dir
-        self.transfer_path = os.path.join(log_dir_transfer, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
-        self.loss_figure_path = os.path.join(self.args.log_dir, 'loss.png')
+        transfer_pth_dir = getattr(self.args, 'log_dir_pth', None) or os.path.join(log_dir_transfer, 'pth')
+        os.makedirs(transfer_pth_dir, exist_ok=True)
+        self.transfer_path = os.path.join(transfer_pth_dir, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
+
+        self.loss_figure_path = os.path.join(getattr(self.args, 'log_dir_pdf', self.args.log_dir), 'loss.png')
 
         ## log
-        if os.path.isdir(args.log_dir) == False and not args.debug:
-            os.makedirs(args.log_dir, exist_ok=True)
-        self.logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data, tag='train')
-        # self.logger = get_logger(args.log_dir, name=args.model + '_unsup', debug=args.debug, data = args.data)
-        self.logger.info('Experiment log path in: {}'.format(args.log_dir))
+        log_root = getattr(args, 'log_dir_log', None) or os.path.join(args.log_dir, 'log')
+        if os.path.isdir(log_root) == False and not args.debug:
+            os.makedirs(log_root, exist_ok=True)
+        self.logger = get_logger(log_root, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=getattr(args, 'run_id', None), console=True)
+        self.logger.info('Experiment log path in: {}'.format(log_root))
 
         # fix: accidental whitespace split in attribute names
         self.ae_channels = self.args.window_size * self.args.nnodes * self.args.in_channels
@@ -105,6 +111,7 @@ class Trainer(object):
 
 
         start_epoch = 0
+        use_adv = bool(getattr(self.args, 'use_adv', True))
         with torch.no_grad():
             pbar = _progress(
                 val_dataloader,
@@ -129,8 +136,10 @@ class Trainer(object):
                     total_val_pred_loss_list.append(pred_loss.item())
 
                 output, target = self.ae_model_batch(batch, training=False)
-                ae_loss = self.ae_loss \
-                    (output.reshape(-1 ,self.args.window_size ,self.args.nnodes ,self.args.out_channels), target.reshape(-1 ,self.args.window_size ,self.args.nnodes ,self.args.out_channels))
+                ae_loss = self.ae_loss(\
+                    output.reshape(-1 ,self.args.window_size ,self.args.nnodes ,self.args.out_channels),
+                    target.reshape(-1 ,self.args.window_size ,self.args.nnodes ,self.args.out_channels)
+                )
                 if not torch.isnan(ae_loss):
                     total_val_ae_loss_list .append(ae_loss.item())
 
@@ -139,14 +148,22 @@ class Trainer(object):
                     generate_batch = torch.from_numpy(generate_batch).float().view(-1, self.args.window_size, self.args.nnodes, self.args.out_channels).to \
                         (batch.device)
 
-                output2, target2 = self.ae_model_batch(generate_batch, training=False)
-                adv_loss = self.ae_loss \
-                    (output2.reshape(-1 ,self.args.window_size ,self.args.nnodes ,self.args.out_channels), target2.reshape(-1 ,self.args.window_size ,self.args.nnodes ,self.args.out_channels))
-                if not torch.isnan(ae_loss):
-                    total_val_adv_loss_list.append(adv_loss.item())
+                if use_adv:
+                    output2, target2 = self.ae_model_batch(generate_batch, training=False)
+                    adv_loss = self.ae_loss(\
+                        output2.reshape(-1 ,self.args.window_size ,self.args.nnodes ,self.args.out_channels),
+                        target2.reshape(-1 ,self.args.window_size ,self.args.nnodes ,self.args.out_channels)
+                    )
+                    if not torch.isnan(ae_loss):
+                        total_val_adv_loss_list.append(adv_loss.item())
 
-                loss1 = 5/ (epoch - start_epoch) * pred_loss.item() + (1 - 1 / (epoch - start_epoch)) * adv_loss.item()
-                loss2 = 3 / (epoch - start_epoch) * ae_loss.item() - (1 - 1 / (epoch - start_epoch)) * adv_loss.item()
+                    loss1 = 5/ (epoch - start_epoch) * pred_loss.item() + (1 - 1 / (epoch - start_epoch)) * adv_loss.item()
+                    loss2 = 3 / (epoch - start_epoch) * ae_loss.item() - (1 - 1 / (epoch - start_epoch)) * adv_loss.item()
+                else:
+                    # stable evaluation metric when adversarial/coupled objective is disabled
+                    adv_loss = torch.tensor(0.0, device=batch.device)
+                    loss1 = pred_loss.item()
+                    loss2 = ae_loss.item()
 
                 loss1_list.append(loss1)
                 loss2_list.append(loss2)
@@ -154,7 +171,7 @@ class Trainer(object):
                 pbar.set_postfix({
                     'pred': f"{pred_loss.item():.4f}",
                     'ae': f"{ae_loss.item():.4f}",
-                    'adv': f"{adv_loss.item():.4f}",
+                    'adv': f"{float(adv_loss.item()):.4f}",
                 })
 
         val_pred_loss = np.array(total_val_pred_loss_list).mean()
@@ -181,6 +198,7 @@ class Trainer(object):
 
         start_epoch = 0
 
+        use_adv = bool(getattr(self.args, 'use_adv', True))
         adv_freeze_other = getattr(self.args, 'adv_freeze_other', True)
         do_clip = bool(getattr(self.args, 'grad_clip', False))
         max_grad_norm = float(getattr(self.args, 'max_grad_norm', 1.0))
@@ -223,6 +241,14 @@ class Trainer(object):
             if do_clip:
                 torch.nn.utils.clip_grad_norm_(self.ae_model.parameters(), max_grad_norm)
             self.ae_optimizer.step()
+
+            if not use_adv:
+                # If coupled/adversarial objective is disabled, the above two updates are the whole training step.
+                # We still log loss1/loss2 for compatibility.
+                loss1_list.append(float(pred_loss.item()))
+                loss2_list.append(float(ae_loss.item()))
+                pbar.set_postfix({'L1': f"{pred_loss.item():.4f}", 'L2': f"{ae_loss.item():.4f}"})
+                continue
 
             # -------------------- 3) coupled update pred model: loss1 --------------------
             self.pred_optimizer.zero_grad(set_to_none=True)
@@ -594,15 +620,20 @@ class PredictedModelTrainer(object):
         if val_loader != None:
             self.val_per_epoch = len(val_loader)
 
-        self.best_path = os.path.join(self.args.log_dir,
-                                      'best_model_' + self.args.data + "_" + self.args.model + '.pth')
-        self.loss_figure_path = os.path.join(self.args.log_dir, 'loss.png')
+        # --- experiment dirs ---
+        # args.log_dir is the experiment root; optionally args.log_dir_pth/log_dir_log are injected by run.py.
+        pth_dir = getattr(self.args, 'log_dir_pth', None) or os.path.join(self.args.log_dir, 'pth')
+        os.makedirs(pth_dir, exist_ok=True)
+        self.best_path = os.path.join(pth_dir, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
+
+        self.loss_figure_path = os.path.join(getattr(self.args, 'log_dir_pdf', self.args.log_dir), 'loss.png')
 
         ## log
-        if os.path.isdir(args.log_dir) == False and not args.debug:
-            os.makedirs(args.log_dir, exist_ok=True)
-        self.logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data, tag='train')
-        self.logger.info('Experiment log path in: {}'.format(args.log_dir))
+        log_root = getattr(args, 'log_dir_log', None) or os.path.join(args.log_dir, 'log')
+        if os.path.isdir(log_root) == False and not args.debug:
+            os.makedirs(log_root, exist_ok=True)
+        self.logger = get_logger(log_root, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=getattr(args, 'run_id', None), console=True)
+        self.logger.info('Experiment log path in: {}'.format(log_root))
 
     def pred_model_batch(self, batch, training=True, mas=None):
         self.pred_model.train(training)
@@ -851,15 +882,20 @@ class AEModelTrainer(object):
         self.scaler = scaler
         self.lr_scheduler = lr_scheduler
 
-        self.best_path = os.path.join(self.args.log_dir,
-                                      'best_model_' + self.args.data + "_" + self.args.model + '.pth')
-        self.loss_figure_path = os.path.join(self.args.log_dir, 'loss.png')
+        # --- experiment dirs ---
+        # args.log_dir is the experiment root; optionally args.log_dir_pth/log_dir_log are injected by run.py.
+        pth_dir = getattr(self.args, 'log_dir_pth', None) or os.path.join(self.args.log_dir, 'pth')
+        os.makedirs(pth_dir, exist_ok=True)
+        self.best_path = os.path.join(pth_dir, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
+
+        self.loss_figure_path = os.path.join(getattr(self.args, 'log_dir_pdf', self.args.log_dir), 'loss.png')
 
         ## log
-        if os.path.isdir(args.log_dir) == False and not args.debug:
-            os.makedirs(args.log_dir, exist_ok=True)
-        self.logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data)
-        self.logger.info('Experiment log path in: {}'.format(args.log_dir))
+        log_root = getattr(args, 'log_dir_log', None) or os.path.join(args.log_dir, 'log')
+        if os.path.isdir(log_root) == False and not args.debug:
+            os.makedirs(log_root, exist_ok=True)
+        self.logger = get_logger(log_root, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=getattr(args, 'run_id', None), console=True)
+        self.logger.info('Experiment log path in: {}'.format(log_root))
 
         self.ae_channels = self.args.window_size * self.args.nnodes * self.args.in_channels
 

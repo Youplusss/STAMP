@@ -1,0 +1,123 @@
+nohup: 忽略输入
+2026-01-04 21:43: Experiment log path in: expe
+True
+train:  (46642, 15, 2, 1)
+val:  (11661, 15, 2, 1)
+test:  (73695, 15, 2, 1)
+test labels:  73695
+[Info] Override args.nnodes: 45 -> 2 (from data)
+*****************Model Parameter*****************
+gc.emb1.weight torch.Size([2, 32]) True
+gc.emb2.weight torch.Size([2, 32]) True
+gc.lin1.weight torch.Size([32, 32]) True
+gc.lin1.bias torch.Size([32]) True
+gc.lin2.weight torch.Size([32, 32]) True
+gc.lin2.bias torch.Size([32]) True
+input.FC.weight torch.Size([16, 1, 1, 1]) True
+input.FC.bias torch.Size([16]) True
+input_mas.FC.weight torch.Size([16, 4, 1, 1]) True
+input_mas.FC.bias torch.Size([16]) True
+st_layers.0.residual_conv2D.FC.weight torch.Size([32, 16, 5, 1]) True
+st_layers.0.residual_conv2D.FC.bias torch.Size([32]) True
+st_layers.0.spat_attn.self_attn.0.in_proj_weight torch.Size([192, 64]) True
+st_layers.0.spat_attn.self_attn.0.in_proj_bias torch.Size([192]) True
+st_layers.0.spat_attn.self_attn.0.out_proj.weight torch.Size([64, 64]) True
+st_layers.0.spat_attn.self_attn.0.out_proj.bias torch.Size([64]) True
+st_layers.0.spat_attn.position_ffwd.0.0.weight torch.Size([32, 64]) True
+st_layers.0.spat_attn.position_ffwd.0.0.bias torch.Size([32]) True
+st_layers.0.spat_attn.position_ffwd.0.2.weight torch.Size([64, 32]) True
+st_layers.0.spat_attn.position_ffwd.0.2.bias torch.Size([64]) True
+st_layers.0.bn.weight torch.Size([32]) True
+st_layers.0.bn.bias torch.Size([32]) True
+st_layers.0.temp_conv.FC.weight torch.Size([16, 16, 5, 1]) True
+st_layers.0.temp_conv.FC.bias torch.Size([16]) True
+st_layers.0.gat.Theta.weight torch.Size([64, 16]) True
+st_layers.1.residual_conv2D.FC.weight torch.Size([64, 32, 5, 1]) True
+st_layers.1.residual_conv2D.FC.bias torch.Size([64]) True
+st_layers.1.spat_attn.self_attn.0.in_proj_weight torch.Size([192, 64]) True
+st_layers.1.spat_attn.self_attn.0.in_proj_bias torch.Size([192]) True
+st_layers.1.spat_attn.self_attn.0.out_proj.weight torch.Size([64, 64]) True
+st_layers.1.spat_attn.self_attn.0.out_proj.bias torch.Size([64]) True
+st_layers.1.spat_attn.position_ffwd.0.0.weight torch.Size([32, 64]) True
+st_layers.1.spat_attn.position_ffwd.0.0.bias torch.Size([32]) True
+st_layers.1.spat_attn.position_ffwd.0.2.weight torch.Size([64, 32]) True
+st_layers.1.spat_attn.position_ffwd.0.2.bias torch.Size([64]) True
+st_layers.1.bn.weight torch.Size([64]) True
+st_layers.1.bn.bias torch.Size([64]) True
+st_layers.1.temp_conv.FC.weight torch.Size([16, 32, 5, 1]) True
+st_layers.1.temp_conv.FC.bias torch.Size([16]) True
+st_layers.1.gat.Theta.weight torch.Size([128, 16]) True
+t_layers.0.temp_attn.self_attn.0.in_proj_weight torch.Size([192, 64]) True
+t_layers.0.temp_attn.self_attn.0.in_proj_bias torch.Size([192]) True
+t_layers.0.temp_attn.self_attn.0.out_proj.weight torch.Size([64, 64]) True
+t_layers.0.temp_attn.self_attn.0.out_proj.bias torch.Size([64]) True
+t_layers.0.temp_attn.position_ffwd.0.0.weight torch.Size([32, 64]) True
+t_layers.0.temp_attn.position_ffwd.0.0.bias torch.Size([32]) True
+t_layers.0.temp_attn.position_ffwd.0.2.weight torch.Size([64, 32]) True
+t_layers.0.temp_attn.position_ffwd.0.2.bias torch.Size([64]) True
+t_layers.1.temp_attn.self_attn.0.in_proj_weight torch.Size([192, 64]) True
+t_layers.1.temp_attn.self_attn.0.in_proj_bias torch.Size([192]) True
+t_layers.1.temp_attn.self_attn.0.out_proj.weight torch.Size([64, 64]) True
+t_layers.1.temp_attn.self_attn.0.out_proj.bias torch.Size([64]) True
+t_layers.1.temp_attn.position_ffwd.0.0.weight torch.Size([32, 64]) True
+t_layers.1.temp_attn.position_ffwd.0.0.bias torch.Size([32]) True
+t_layers.1.temp_attn.position_ffwd.0.2.weight torch.Size([64, 32]) True
+t_layers.1.temp_attn.position_ffwd.0.2.bias torch.Size([64]) True
+residual_conv2D.FC.weight torch.Size([64, 16, 5, 1]) True
+residual_conv2D.FC.bias torch.Size([64]) True
+cat_conv2D.FC.weight torch.Size([32, 192, 12, 1]) True
+cat_conv2D.FC.bias torch.Size([32]) True
+predict.weight torch.Size([3, 1, 1, 32]) True
+predict.bias torch.Size([3]) True
+Total params num: 184755
+*****************Finish Parameter****************
+*****************Model Parameter*****************
+encoder.linear1.weight torch.Size([15, 30]) True
+encoder.linear1.bias torch.Size([15]) True
+encoder.linear2.weight torch.Size([7, 15]) True
+encoder.linear2.bias torch.Size([7]) True
+encoder.linear3.weight torch.Size([15, 7]) True
+encoder.linear3.bias torch.Size([15]) True
+decoder.linear1.weight torch.Size([7, 15]) True
+decoder.linear1.bias torch.Size([7]) True
+decoder.linear2.weight torch.Size([15, 7]) True
+decoder.linear2.bias torch.Size([15]) True
+decoder.linear3.weight torch.Size([30, 15]) True
+decoder.linear3.bias torch.Size([30]) True
+Total params num: 1409
+*****************Finish Parameter****************
+Creat Log File in:  expe/MSL_train.log
+Train 1/30:   0%|          | 0/5831 [00:00<?, ?it/s]                                                    Traceback (most recent call last):
+  File "/home/youwenlong/code/STAMP/run.py", line 395, in <module>
+    main()
+  File "/home/youwenlong/code/STAMP/run.py", line 387, in main
+    train_history, val_history = trainer.train()
+                                 ^^^^^^^^^^^^^^^
+  File "/home/youwenlong/code/STAMP/trainer.py", line 340, in train
+    train_loss1, train_loss2 = self.train_epoch(epoch)
+                               ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/youwenlong/code/STAMP/trainer.py", line 208, in train_epoch
+    output, target, generate_batch = self.pred_model_batch(batch, training=True, mas=mas)
+                                     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/youwenlong/code/STAMP/trainer.py", line 65, in pred_model_batch
+    output = self.pred_model(x, mas=mas)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/youwenlong/.conda/envs/MambaTSAD/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/youwenlong/.conda/envs/MambaTSAD/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/youwenlong/code/STAMP/model/net.py", line 81, in forward
+    adj = self.gc(self.idx)
+          ^^^^^^^^^^^^^^^^^
+  File "/home/youwenlong/.conda/envs/MambaTSAD/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1775, in _wrapped_call_impl
+    return self._call_impl(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/youwenlong/.conda/envs/MambaTSAD/lib/python3.11/site-packages/torch/nn/modules/module.py", line 1786, in _call_impl
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/youwenlong/code/STAMP/model/layers.py", line 94, in forward
+    s1, t1 = (adj + torch.rand_like(adj) * 0.01).topk(self.k, 1)
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: selected index k out of range

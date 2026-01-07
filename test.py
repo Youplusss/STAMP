@@ -261,12 +261,22 @@ def infer_and_override_data_shape(args, train_loader):
 def main():
     args = build_arg_parser().parse_args()
 
+    # 训练脚本会把 args.model 变成 v2_<pred_model>
     args.model = args.model + args.pred_model
+
+    # Resolve experiment directories
+    from lib.paths import resolve_experiment_dirs
+    exp = resolve_experiment_dirs(args.log_dir)
+    args.run_id = exp.run_id
+    args.log_dir = exp.root
+    args.log_dir_log = exp.log_dir
+    args.log_dir_pth = exp.pth_dir
+    args.log_dir_pdf = exp.pdf_dir
 
     os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
 
     from lib.utils import get_default_device, concate_results
-    from lib.logger import get_logger
+    from lib.logger import get_logger, log_hparams
     from model.utils import init_seed
 
     # device
@@ -317,10 +327,10 @@ def main():
         ae_model = EncoderDecoder(AE_IN_CHANNELS, latent_size, AE_IN_CHANNELS, not args.real_value)
 
     # logger
-    logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data, tag='test')
+    logger = get_logger(exp.log_dir, name=args.model, debug=args.debug, data=args.data, tag='test', model=args.model, run_id=exp.run_id, console=True)
+    log_hparams(logger, args)
 
-    # checkpoint path
-    model_path = os.path.join(args.log_dir, 'best_model_' + args.data + "_" + args.model + '.pth')
+    model_path = os.path.join(exp.pth_dir, 'best_model_' + args.data + "_" + args.model + '.pth')
     print("load model:", model_path)
 
     from trainer import Tester

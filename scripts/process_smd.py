@@ -132,6 +132,7 @@ def preprocess_smd(
     machines: Optional[List[str]] = None,
     max_machines: Optional[int] = None,
     include_attack_in_train: bool = True,
+    scale_mode: str = "none",
 ):
     os.makedirs(out_root, exist_ok=True)
 
@@ -156,9 +157,17 @@ def preprocess_smd(
     print(f"[SMD] found machines={len(all_machine_ids)}")
     print(f"[SMD] processing machines={len(machine_ids)}: {machine_ids[:5]}{'...' if len(machine_ids) > 5 else ''}")
 
+    scale_mode = str(scale_mode).lower().strip()
+    if scale_mode not in {"none", "standard", "global_standard"}:
+        raise ValueError("scale_mode must be one of: none, standard, global_standard")
+
+    # Back-compat: if --use_global_scaler is set, treat it like global_standard
+    if use_global_scaler:
+        scale_mode = "global_standard"
+
     # optional global scaler
     global_scaler: Optional[StandardScaler] = None
-    if use_global_scaler:
+    if scale_mode == "global_standard":
         print("[SMD] fitting global StandardScaler on ALL machines' train data...")
         trains = []
         for mid in machine_ids:
@@ -182,15 +191,20 @@ def preprocess_smd(
         elif int(tr_raw.shape[1]) != int(feature_dim):
             raise ValueError(f"Feature dim mismatch for {mid}: {tr_raw.shape[1]} vs {feature_dim}")
 
-        # scale per-machine (default) or globally
-        if use_global_scaler:
-            scaler = global_scaler
+        # scale per-machine (default) or globally; or disable scaling to match SWaT/WADI loaders
+        if scale_mode == "none":
+            tr = tr_raw.astype(np.float32)
+            te = te_raw.astype(np.float32)
         else:
-            scaler = StandardScaler()
-            scaler.fit(tr_raw)
+            if scale_mode == "global_standard":
+                scaler = global_scaler
+            else:
+                scaler = StandardScaler()
+                scaler.fit(tr_raw)
 
-        tr = scaler.transform(tr_raw).astype(np.float32)
-        te = scaler.transform(te_raw).astype(np.float32)
+            tr = scaler.transform(tr_raw).astype(np.float32)
+            te = scaler.transform(te_raw).astype(np.float32)
+
         y = y_raw.astype(np.int64)
 
         # downsample like SWaT/WADI
@@ -261,10 +275,19 @@ def parse_args():
     p.add_argument("--raw_root", type=str, default=os.path.join("data", "SMD"), help="raw SMD root (train/test/test_label)")
     p.add_argument("--out_root", type=str, default=os.path.join("dataset", "SMD"), help="output root (dataset/SMD)")
 
-    p.add_argument("--downsample_factor", type=int, default=10, help="median-pool downsample factor (>1 enables)")
+    # Match SWaT/WADI default behavior: do downsampling at training-time via --down_len.
+    p.add_argument("--downsample_factor", type=int, default=1, help="median-pool downsample factor in preprocess (>1 enables)")
     p.add_argument("--skip_head", type=int, default=0, help="drop the first N rows for each machine (default: 0)")
 
-    p.add_argument("--use_global_scaler", action="store_true", help="fit one StandardScaler using all machines' train data")
+    # Keep for backward compatibility; maps to scale_mode=global_standard.
+    p.add_argument("--use_global_scaler", action="store_true", help="(deprecated) use one StandardScaler using all machines' train data")
+    p.add_argument(
+        "--scale_mode",
+        type=str,
+        default="none",
+        choices=["none", "standard", "global_standard"],
+        help="scaling in preprocess: none (recommended; match SWaT/WADI loaders), standard (per-machine), global_standard",
+    )
 
     p.add_argument("--max_train_rows_per_machine", type=int, default=None, help="truncate train length per machine")
     p.add_argument("--max_test_rows_per_machine", type=int, default=None, help="truncate test length per machine")
@@ -294,4 +317,5 @@ if __name__ == "__main__":
         machines=args.machines,
         max_machines=args.max_machines,
         include_attack_in_train=not args.no_attack_in_train,
+        scale_mode=getattr(args, "scale_mode", "none"),
     )

@@ -3,12 +3,21 @@ import argparse
 
 from lib.cli import add_common_args, finalize_args
 from lib.paths import resolve_dataset_paths
+from lib.paths import resolve_experiment_dirs
 
 from lib.evaluate import *
 
 parser = argparse.ArgumentParser(description='PyTorch Prediction Model on Time-series Dataset')
 add_common_args(parser)
 args = finalize_args(parser.parse_args())
+
+# Resolve experiment directories
+exp = resolve_experiment_dirs(getattr(args, 'log_dir', 'expe'))
+args.run_id = exp.run_id
+args.log_dir = exp.root
+args.log_dir_log = exp.log_dir
+args.log_dir_pth = exp.pth_dir
+args.log_dir_pdf = exp.pdf_dir
 
 # Provide a reasonable default for NPZ mode (SMD unsup bundle) if user didn't pass --unsup_npz.
 if args.unsup_npz is None:
@@ -189,8 +198,11 @@ latent_size = args.window_size * args.latent_size
 pred_model = STATModel(args, DEVICE, args.window_size - args.n_pred, channels_list, static_feat=None)
 ae_model = EncoderDecoder(AE_IN_CHANNELS, latent_size, AE_IN_CHANNELS, not args.real_value)
 
-logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data)
-model_path = os.path.join(args.log_dir, 'best_model_' + args.data + "_" + args.model + '.pth')
+from lib.logger import get_logger, log_hparams
+logger = get_logger(exp.log_dir, name=args.model, debug=args.debug, data=args.data, tag='test', model=args.model, run_id=args.run_id, console=True)
+log_hparams(logger, args)
+
+model_path = os.path.join(exp.pth_dir, 'best_model_' + args.data + "_" + args.model + '.pth')
 
 tester = Tester(pred_model, ae_model, args, min_max_scaler, logger, path=model_path,
                 alpha=args.test_alpha, beta=args.test_beta, gamma=args.test_gamma)
