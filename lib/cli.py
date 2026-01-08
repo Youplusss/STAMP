@@ -107,10 +107,22 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                         help='freeze the other branch during adversarial/coupled update to save memory')
 
     # ---- Stabilized adversarial training (recommended for Mamba models) ----
-    parser.add_argument('--adv_mode', type=str, default='hinge', choices=['hinge', 'exp', 'legacy'],
-                        help='Adversarial objective for AE. hinge: bounded hinge penalty (recommended). exp: exp(-adv/tau). legacy: ae_loss - lambda*adv_loss (can diverge).')
+    parser.add_argument('--use_adv', type=eval, default=True,
+                        help='whether to use adversarial/coupled training (True) or only pred+recon base losses (False).')
+    parser.add_argument('--adv_train_strategy', type=str, default='2step', choices=['legacy4', '4step', '2step'],
+                        help='legacy4: original 4 updates per batch + 5/e,3/e schedule; '
+                             '4step: 4 updates but stabilized objectives; '
+                             '2step: 2 updates (GAN-style), recommended for Mamba.')
+    parser.add_argument('--adv_scope', type=str, default='pred', choices=['full', 'pred', 'history'],
+                        help='where to compute adversarial reconstruction loss on generated window: '
+                             'full=whole window; pred=only last n_pred steps (recommended); history=only context part.')
+    parser.add_argument('--adv_mode', type=str, default='hinge', choices=['hinge', 'softplus', 'exp', 'legacy'],
+                        help='AE adversarial objective. legacy: ae_loss - lambda*adv_loss (can diverge). '
+                             'hinge/softplus/exp are bounded variants (recommended for Mamba).')
     parser.add_argument('--adv_margin', type=float, default=0.1,
                         help='Margin for hinge adversarial penalty: encourage adv_loss >= ae_loss + margin.')
+    parser.add_argument('--adv_margin_mode', type=str, default='rel', choices=['abs', 'rel'],
+                        help='margin type: abs => adv_loss >= ae_loss + margin; rel => adv_loss >= (1+margin)*ae_loss (scale-invariant).')
     parser.add_argument('--adv_tau', type=float, default=1.0,
                         help='Temperature for exp adversarial penalty exp(-adv/tau).')
     parser.add_argument('--adv_lambda_pred', type=float, default=0.5,

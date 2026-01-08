@@ -76,16 +76,50 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--batch_size', type=int, default=8, help='batch size')
     parser.add_argument('--epochs', type=int, default=30, help='number of epoch')
 
-    # Whether to use the coupled/adversarial objectives (loss1/loss2) in addition to plain pred_loss/ae_loss.
-    # For some models (notably mamba recon), the adversarial terms can destabilize training after a few epochs.
-    parser.add_argument('--use_adv', default=True, type=eval,
-                        help='use coupled/adversarial training objectives (default True; set False for stable mamba-mamba)')
-
     parser.add_argument('--is_down_sample', type=eval, default=True, help='down-sample raw series or not')
     parser.add_argument('--down_len', type=int, default=100, help='down sample ratio')
 
     # 对抗/耦合训练中是否冻结另一分支参数（推荐 True，显存/速度更友好）
     parser.add_argument('--adv_freeze_other', type=eval, default=True)
+
+    # -------------------------- adversarial / coupled training (NEW) --------------------------
+    # 为了调试与适配 Mamba，本 repo 的 Trainer 支持关闭对抗训练，以及多种更稳定的损失形式。
+    parser.add_argument('--use_adv', type=eval, default=True,
+                        help='whether to use adversarial/coupled training. False => only pred_loss + ae_loss (stable baseline).')
+    parser.add_argument('--adv_train_strategy', type=str, default='legacy4',
+                        choices=['legacy4', '4step', '2step'],
+                        help='legacy4: original 4 updates per batch + 5/e,3/e schedule; '
+                             '4step: 4 updates but stabilized objectives; '
+                             '2step: 2 updates (GAN-style), recommended for Mamba.')
+    parser.add_argument('--adv_scope', type=str, default='full',
+                        choices=['full', 'pred', 'history'],
+                        help='where to compute adversarial reconstruction loss on generated window: '
+                             'full=whole window; pred=only last n_pred steps (recommended); history=only context part.')
+    parser.add_argument('--adv_mode', type=str, default='legacy',
+                        choices=['legacy', 'hinge', 'softplus', 'exp'],
+                        help='AE adversarial objective. legacy: ae_loss - lambda*adv_loss (can be unstable). '
+                             'hinge/softplus/exp are bounded variants (recommended for Mamba).')
+    parser.add_argument('--adv_margin', type=float, default=0.1,
+                        help='margin value used by hinge/softplus modes. See trainer.py/lib/adv_losses.py for definition.')
+    parser.add_argument('--adv_margin_mode', type=str, default='rel', choices=['abs', 'rel'],
+                        help='margin type: abs => adv_loss >= ae_loss + margin; rel => adv_loss >= (1+margin)*ae_loss (scale-invariant).')
+    parser.add_argument('--adv_tau', type=float, default=1.0,
+                        help='temperature for softplus/exp modes (smoother gradients).')
+    # weight schedule (warmup + linear ramp) for stabilized strategies
+    parser.add_argument('--adv_lambda_pred', type=float, default=1.0,
+                        help='max weight for adv_loss in pred update (after warmup+ramp).')
+    parser.add_argument('--adv_lambda_ae', type=float, default=1.0,
+                        help='max weight for adversarial penalty in AE update (after warmup+ramp).')
+    parser.add_argument('--adv_warmup_epochs', type=int, default=1,
+                        help='warmup epochs before enabling adversarial weights.')
+    parser.add_argument('--adv_ramp_epochs', type=int, default=5,
+                        help='ramp epochs to linearly increase adversarial weights after warmup.')
+
+    # optional weight decay knobs (Adam) (kept consistent with lib/cli.py)
+    parser.add_argument('--pred_weight_decay', type=float, default=1e-4,
+                        help='weight decay for prediction model optimizer')
+    parser.add_argument('--ae_weight_decay', type=float, default=1e-4,
+                        help='weight decay for reconstruction model optimizer')
 
     # -------------------------- lr decay / early stop (kept for compatibility) --------------------------
     parser.add_argument('--early_stop', default=True, type=eval)
@@ -295,15 +329,16 @@ def main():
     parser = build_arg_parser()
     args = parser.parse_args()
 
-    # Name: v2_mamba / v2_gat...
+    # 名称：v2_mamba / v2_gat...
     args.model = args.model + args.pred_model
 
-    # Resolve experiment directories
+    # Resolve experiment directories (expe/{log,pth,pdf})
     from lib.paths import resolve_experiment_dirs
     exp = resolve_experiment_dirs(args.log_dir)
     args.run_id = exp.run_id
     args.log_dir = exp.root
-    args.log_dir_transfer = exp.root
+    # compatibility fields used across the repo
+    args.log_dir_transfer = args.log_dir_transfer or exp.root
     args.log_dir_log = exp.log_dir
     args.log_dir_pth = exp.pth_dir
     args.log_dir_pdf = exp.pdf_dir
@@ -318,6 +353,7 @@ def main():
     # device
     print(torch.cuda.is_available())
     device = get_default_device()
+    # make device accessible to Trainer/Tester
     args.device = device
 
     # load data
@@ -325,6 +361,17 @@ def main():
 
     # infer shape
     infer_and_override_data_shape(args, train_loader)
+
+    if args.in_channels != args.out_channels:
+        msg = (
+            "For STAMP-style generate_batch concat, require in_channels==out_channels, "
+            + "got "
+            + str(args.in_channels)
+            + " vs "
+            + str(args.out_channels)
+            + "."
+        )
+        raise ValueError(msg)
 
     # seed
     init_seed(args.seed)
@@ -361,26 +408,20 @@ def main():
     ae_model = to_device(ae_model, device)
 
     # optimizers / losses
-    pred_optimizer = torch.optim.Adam(pred_model.parameters(), lr=args.pred_lr_init, eps=1.0e-8, weight_decay=1e-4)
-    ae_optimizer = torch.optim.Adam(ae_model.parameters(), lr=args.ae_lr_init, eps=1.0e-8, weight_decay=1e-4)
+    # Optimizers (keep weight_decay configurable; some Mamba backbones are sensitive)
+    pred_wd = float(getattr(args, 'pred_weight_decay', 1e-4))
+    ae_wd = float(getattr(args, 'ae_weight_decay', 1e-4))
+    pred_optimizer = torch.optim.Adam(pred_model.parameters(), lr=args.pred_lr_init, eps=1.0e-8, weight_decay=pred_wd)
+    ae_optimizer = torch.optim.Adam(ae_model.parameters(), lr=args.ae_lr_init, eps=1.0e-8, weight_decay=ae_wd)
 
     pred_loss = masked_mse_loss(mask_value=-0.01)
     ae_loss = masked_mse_loss(mask_value=-0.01)
 
-    # logger (file only; keep tqdm progress on console)
-    logger = get_logger(
-        exp.log_dir,
-        name=args.model,
-        debug=args.debug,
-        data=args.data,
-        tag='train',
-        model=args.model,
-        run_id=exp.run_id,
-        console=True,
-    )
+    # logger (write to expe/log; keep tqdm in console)
+    logger = get_logger(args.log_dir_log, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=args.run_id, console=True)
     log_hparams(logger, args)
 
-    # print params (parameter dump is kept as requested)
+    # print params
     print_model_parameters(pred_model)
     print_model_parameters(ae_model)
 
@@ -403,10 +444,10 @@ def main():
 
     train_history, val_history = trainer.train()
 
-    # plots -> expe/pdf
-    plot_history(train_history, model=args.model, mode="train", data=args.data, out_dir=exp.pdf_dir, show=False)
-    plot_history(val_history, model=args.model, mode="val", data=args.data, out_dir=exp.pdf_dir, show=False)
-    plot_history2(val_history, model=args.model, mode="val", data=args.data, out_dir=exp.pdf_dir, show=False)
+    # Always save figures under expe/pdf
+    plot_history(train_history, model=args.model, mode="train", data=args.data, out_dir=args.log_dir_pdf, show=False)
+    plot_history(val_history, model=args.model, mode="val", data=args.data, out_dir=args.log_dir_pdf, show=False)
+    plot_history2(val_history, model=args.model, mode="val", data=args.data, out_dir=args.log_dir_pdf, show=False)
 
 
 if __name__ == '__main__':

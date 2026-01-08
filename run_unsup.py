@@ -4,12 +4,21 @@ import argparse
 from lib.cli import add_common_args, finalize_args
 from lib.metrics import masked_mse_loss
 from lib.paths import resolve_dataset_paths
+from lib.paths import resolve_experiment_dirs
 
 
 parser = argparse.ArgumentParser(description='PyTorch Prediction Model on Time-series Dataset')
 add_common_args(parser)
 
 args = finalize_args(parser.parse_args())
+
+# Resolve experiment directories (expe/{log,pth,pdf})
+exp = resolve_experiment_dirs(getattr(args, 'log_dir', 'expe'))
+args.run_id = exp.run_id
+args.log_dir = exp.root
+args.log_dir_log = exp.log_dir
+args.log_dir_pth = exp.pth_dir
+args.log_dir_pdf = exp.pdf_dir
 
 # Provide a reasonable default for NPZ mode (SMD unsup bundle) if user didn't pass --unsup_npz.
 if args.unsup_npz is None:
@@ -191,10 +200,11 @@ trainer = Trainer(pred_model, pred_loss, pred_optimizer, ae_model, ae_loss, ae_o
 
 train_history, val_history = trainer.train()
 
+# logger
 from lib.logger import get_logger, log_hparams
-logger = get_logger(args.log_dir, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=args.run_id, console=True)
+logger = get_logger(args.log_dir_log, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=args.run_id, console=True)
 log_hparams(logger, args)
 
 plot_history(train_history, model=args.model, mode="train", data=args.data, out_dir=args.log_dir_pdf, show=False)
 plot_history(val_history, model=args.model, mode="val", data=args.data, out_dir=args.log_dir_pdf, show=False)
-plot_history2(val_history, model = args.model, mode="val", data=args.data)
+plot_history2(val_history, model=args.model, mode="val", data=args.data, out_dir=args.log_dir_pdf, show=False)

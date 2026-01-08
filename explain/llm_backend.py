@@ -16,6 +16,14 @@ class LLMGenerationConfig:
     repetition_penalty: float = 1.05
 
 
+@dataclass
+class HFLoadConfig:
+    """Extra loading knobs for HF models (mainly for VRAM control)."""
+
+    load_in_8bit: bool = False
+    load_in_4bit: bool = False
+
+
 class BaseExplainer:
     def explain(self, prompt: str, evidence: Dict[str, Any]) -> str:
         raise NotImplementedError
@@ -88,6 +96,7 @@ class HuggingFaceCausalLMExplainer(BaseExplainer):
         hf_endpoint: Optional[str] = None,
         cache_dir: Optional[str] = None,
         force_gpu: bool = False,
+        hf_load_cfg: Optional[HFLoadConfig] = None,
     ):
         self.model_name_or_path = model_name_or_path
         self.device = device
@@ -96,6 +105,7 @@ class HuggingFaceCausalLMExplainer(BaseExplainer):
         self.trust_remote_code = trust_remote_code
         self.local_files_only = local_files_only
         self.force_gpu = bool(force_gpu)
+        self.hf_load_cfg = hf_load_cfg or HFLoadConfig()
 
         self.hf_endpoint = (
             hf_endpoint
@@ -121,23 +131,45 @@ class HuggingFaceCausalLMExplainer(BaseExplainer):
                 "Please pip install transformers>=4.38 and a compatible torch."
             ) from e
 
-        # Pick a stable, explicit model id for GPT2 to avoid cache duplication
-        # between 'gpt2' and 'openai-community/gpt2'.
+        # If user requested GPU, prefer CUDA when available.
+        if self.force_gpu and (self.device in (None, "auto", "cpu")):
+            if torch.cuda.is_available():
+                self.device = "cuda"
+
         model_id = self.model_name_or_path
         if model_id == "gpt2":
             model_id = "openai-community/gpt2"
 
-        # If a mirror endpoint is provided, set envs here so even non-bash launches work.
-        if self.hf_endpoint:
-            os.environ["HF_ENDPOINT"] = str(self.hf_endpoint)
-            os.environ["HUGGINGFACE_HUB_BASE_URL"] = str(self.hf_endpoint)
+        # If we're in offline mode, prefer resolving the cached snapshot path and load from it.
+        # This completely avoids any Hub metadata requests (e.g., model_info()) inside tokenizer helpers.
+        if self.local_files_only:
+            try:
+                from huggingface_hub import snapshot_download
 
-        # Ensure caches are consistent. Setting HF_HOME alone is sometimes not enough for
-        # older transformers/huggingface_hub combinations.
+                local_path = snapshot_download(
+                    repo_id=model_id,
+                    cache_dir=str(self.cache_dir) if self.cache_dir else None,
+                    local_files_only=True,
+                    resume_download=False,
+                )
+                if local_path and os.path.isdir(local_path):
+                    model_id = local_path
+            except Exception:
+                # Best effort: if snapshot resolution fails, fall back to model_id.
+                pass
+
+        # Ensure caches are consistent.
         if self.cache_dir:
             os.environ["HF_HOME"] = str(self.cache_dir)
             os.environ.setdefault("TRANSFORMERS_CACHE", str(self.cache_dir))
             os.environ.setdefault("HF_HUB_CACHE", os.path.join(str(self.cache_dir), "hub"))
+
+        # Strong offline mode: prevents any Hub metadata requests.
+        # This is important because some tokenizers may call huggingface_hub.model_info()
+        # even when local_files_only=True (e.g., template/regex detection).
+        if self.local_files_only:
+            os.environ.setdefault("HF_HUB_OFFLINE", "1")
+            os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
 
         # IMPORTANT: On some torch+cudnn+cublas+transformers combos, GPT2 generation can
         # trigger a device-side assert (index out of bounds) in CUDA kernels.
@@ -146,7 +178,7 @@ class HuggingFaceCausalLMExplainer(BaseExplainer):
         if (isinstance(self.device, str) and self.device.startswith("cuda")) and not self.force_gpu:
             self.device = "cpu"
 
-        # Disable SDPA/flash attention fast paths. This is best-effort; CPU still safest.
+        # Disable SDPA/flash attention fast paths. This is best-effort.
         os.environ.setdefault("TORCH_SDPA_DISABLE", "1")
         os.environ.setdefault("XFORMERS_DISABLED", "1")
         os.environ.setdefault("TRANSFORMERS_ATTENTION_IMPLEMENTATION", "eager")
@@ -155,7 +187,8 @@ class HuggingFaceCausalLMExplainer(BaseExplainer):
         dtype = None
         if isinstance(self.torch_dtype, str):
             if self.torch_dtype.lower() == "auto":
-                dtype = None
+                # Prefer fp16 on GPU for speed and VRAM; keep None on CPU.
+                dtype = torch.float16 if (isinstance(self.device, str) and self.device.startswith("cuda")) else None
             elif self.torch_dtype.lower() in ["fp16", "float16"]:
                 dtype = torch.float16
             elif self.torch_dtype.lower() in ["bf16", "bfloat16"]:
@@ -170,7 +203,28 @@ class HuggingFaceCausalLMExplainer(BaseExplainer):
         if self.cache_dir:
             load_kwargs["cache_dir"] = str(self.cache_dir)
 
-        target_device = self.device
+        # Optional quantization via bitsandbytes.
+        # NOTE: if enabled, model is already placed on GPU with device_map and should NOT be moved via .to().
+        quantized = False
+        if self.hf_load_cfg.load_in_4bit or self.hf_load_cfg.load_in_8bit:
+            try:
+                from transformers import BitsAndBytesConfig
+            except Exception as e:
+                raise ImportError(
+                    "To use 4-bit/8-bit loading, install bitsandbytes and a recent transformers. "
+                    "pip install bitsandbytes"
+                ) from e
+
+            bnb_cfg = BitsAndBytesConfig(
+                load_in_4bit=bool(self.hf_load_cfg.load_in_4bit),
+                load_in_8bit=bool(self.hf_load_cfg.load_in_8bit),
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4",
+            )
+            load_kwargs["quantization_config"] = bnb_cfg
+            load_kwargs["device_map"] = "auto"  # respects CUDA_VISIBLE_DEVICES
+            quantized = True
 
         try:
             tok = AutoTokenizer.from_pretrained(model_id, **load_kwargs)
@@ -192,12 +246,27 @@ class HuggingFaceCausalLMExplainer(BaseExplainer):
                 f"{e}\n\n[Hint] {hint}\n[Debug] hf_endpoint={self.hf_endpoint}, cache_dir={self.cache_dir}, local_files_only={self.local_files_only}"
             ) from e
 
-        # Move the model. If this fails, stay on CPU.
-        try:
-            model.to(target_device)
-        except Exception:
-            model.to("cpu")
-            self.device = "cpu"
+        # Move model when not quantized.
+        if not quantized:
+            target_device = self.device
+            try:
+                model.to(target_device)
+            except Exception as e:
+                # Provide a clear hint instead of silently falling back.
+                msg = (
+                    f"Failed to move model to device={target_device}. Falling back to CPU.\n"
+                    f"Root error: {repr(e)}\n"
+                    "Common causes: (1) GPU OOM (VRAM too small / already occupied), (2) CUDA not visible, "
+                    "(3) CPU-only torch.\n"
+                    "Tips: set CUDA_VISIBLE_DEVICES to a free GPU; or enable 4-bit loading (requires bitsandbytes)."
+                )
+                print("[Explain][HF][WARN] " + msg)
+                model.to("cpu")
+                self.device = "cpu"
+        else:
+            # device handled by device_map
+            if torch.cuda.is_available():
+                self.device = "cuda"
 
         model.eval()
         self._tokenizer = tok
@@ -205,7 +274,7 @@ class HuggingFaceCausalLMExplainer(BaseExplainer):
 
         # lightweight debug (helps confirm actual device used)
         try:
-            print(f"[Explain][HF] Loaded LLM='{model_id}' on device='{self.device}' (force_gpu={self.force_gpu})")
+            print(f"[Explain][HF] Loaded LLM='{model_id}' on device='{self.device}' (force_gpu={self.force_gpu}, 4bit={self.hf_load_cfg.load_in_4bit}, 8bit={self.hf_load_cfg.load_in_8bit})")
         except Exception:
             pass
 
@@ -219,9 +288,11 @@ class HuggingFaceCausalLMExplainer(BaseExplainer):
 
         want_zh = ("只用中文" in prompt or "中文" in prompt)
 
-        # Prefer chat template for instruct/chat models (e.g., Qwen2.5-Instruct).
-        # This reduces prompt-echoing and improves instruction following.
-        use_chat_template = hasattr(tok, "apply_chat_template")
+        # Prefer chat template only when the tokenizer actually has a chat_template configured.
+        # Some tokenizers expose apply_chat_template() but do not ship with a template (e.g., GPT-2)
+        # and will raise: "tokenizer.chat_template is not set".
+        tok_chat_template = getattr(tok, "chat_template", None)
+        use_chat_template = bool(tok_chat_template) and hasattr(tok, "apply_chat_template")
 
         if use_chat_template:
             system = (
@@ -347,6 +418,8 @@ def build_explainer(
     hf_endpoint: Optional[str] = None,
     cache_dir: Optional[str] = None,
     force_gpu: bool = False,
+    hf_load_in_8bit: bool = False,
+    hf_load_in_4bit: bool = False,
 ) -> BaseExplainer:
     backend = (backend or "template").lower()
     if backend in ["none", "template", "rule", "rules"]:
@@ -360,6 +433,7 @@ def build_explainer(
             do_sample=do_sample,
             repetition_penalty=repetition_penalty,
         )
+        load_cfg = HFLoadConfig(load_in_8bit=bool(hf_load_in_8bit), load_in_4bit=bool(hf_load_in_4bit))
         return HuggingFaceCausalLMExplainer(
             model_name_or_path=model_name_or_path,
             device=device,
@@ -369,6 +443,7 @@ def build_explainer(
             hf_endpoint=hf_endpoint,
             cache_dir=cache_dir,
             force_gpu=force_gpu,
+            hf_load_cfg=load_cfg,
         )
 
     raise ValueError(f"Unknown LLM backend: {backend}. Use template|hf.")

@@ -2,6 +2,7 @@
 
 import os
 import argparse
+import sys
 
 import torch
 
@@ -113,8 +114,10 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument('--explain_backend', type=str, default='template',
                         choices=['template', 'hf'],
                         help='explanation backend: template (no deps) | hf (HuggingFace transformers causal LM)')
-    parser.add_argument('--explain_llm_model', type=str, default='gpt2',
-                        help='HuggingFace model name or local path (only used when explain_backend=hf)')
+    parser.add_argument('--explain_llm_model', type=str, default='Qwen/Qwen2.5-7B-Instruct',
+                        help='HuggingFace model name or local path (only used when explain_backend=hf). Default: Qwen2.5-7B-Instruct.')
+    parser.add_argument('--explain_cuda_visible_devices', type=str, default=None,
+                        help='Optional: set CUDA_VISIBLE_DEVICES for the explanation LLM process (e.g., "3"). This is useful to pin the LLM to one GPU.')
     parser.add_argument('--explain_language', type=str, default='zh',
                         help='prompt language: zh or en')
     parser.add_argument('--explain_topk_features', type=int, default=5,
@@ -151,12 +154,36 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help='(hf backend) HuggingFace access token. Helps avoid 429 rate limits on mirrors/HF Hub. You can also set env HF_TOKEN/HUGGINGFACE_HUB_TOKEN.')
     parser.add_argument('--explain_force_gpu', default=False, type=eval,
                         help='(hf backend) force running the LLM on CUDA. Default False because some torch+transformers+CUDA combos crash with device-side assert.')
+    parser.add_argument('--explain_all_methods', default=False, type=eval,
+                        help='Generate explanations for all aggregation methods (max/sum/mean) instead of only the chosen method.')
+    parser.add_argument('--explain_hf_load_in_4bit', default=True, type=eval,
+                        help='(hf backend) Load LLM in 4-bit (bitsandbytes) to reduce VRAM. Recommended for 7B on ~16GB VRAM.')
+    parser.add_argument('--explain_hf_load_in_8bit', default=False, type=eval,
+                        help='(hf backend) Load LLM in 8-bit (bitsandbytes). Use if 4-bit is not desired.')
+    parser.add_argument('--explain_progress', default=True, type=eval,
+                        help='Show a tqdm progress bar during LLM explanation generation (per anomaly segment).')
+    parser.add_argument('--explain_log_progress_every', type=int, default=1,
+                        help='When not running in a TTY (e.g., nohup redirect), print a log-friendly progress line every N segments (1=every segment).')
 
     return parser
 
 
 def main():
     args = build_arg_parser().parse_args()
+
+    # Make stdout/stderr line-buffered under nohup so `tail -f` shows incremental progress.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except Exception:
+        pass
+
+    # Optional: pin GPUs for this process.
+    # IMPORTANT: do NOT override an already-set CUDA_VISIBLE_DEVICES unless user explicitly requests it.
+    if getattr(args, 'explain_cuda_visible_devices', None):
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(args.explain_cuda_visible_devices)
+    else:
+        os.environ.setdefault('CUDA_VISIBLE_DEVICES', str(args.gpu_id))
 
     # Optional: set HF token for authenticated hub access (helps avoid 429 rate limits)
     if getattr(args, 'explain_hf_token', None):
@@ -187,7 +214,6 @@ def main():
     args.log_dir_pth = exp.pth_dir
     args.log_dir_pdf = exp.pdf_dir
 
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
 
     from lib.utils import get_default_device, concate_results
     from model.utils import init_seed
@@ -324,30 +350,58 @@ def main():
         chosen = results_by_method[best_method]
         chosen_th = float(chosen['info'].get('threshold', 0.0))
 
-        out_json = args.explain_out_json or os.path.join(args.log_dir, f"explanations_{args.data}_{best_method}.json")
-        out_md = args.explain_out_md or os.path.join(args.log_dir, f"explanations_{args.data}_{best_method}.md")
+        if args.explain_all_methods:
+            for method_name, result in results_by_method.items():
+                out_json = args.explain_out_json or os.path.join(args.log_dir, f"explanations_{args.data}_{method_name}.json")
+                out_md = args.explain_out_md or os.path.join(args.log_dir, f"explanations_{args.data}_{method_name}.md")
 
-        print(f"\n[Explain] Using method={best_method}, threshold={chosen_th:.6f}")
-        print(f"[Explain] Writing JSON to: {out_json}")
-        print(f"[Explain] Writing MD   to: {out_md}")
+                method_th = float(result['info'].get('threshold', chosen_th))
+                print(f"\n[Explain] Using method={method_name}, threshold={method_th:.6f}")
+                print(f"[Explain] Writing JSON to: {out_json}")
+                print(f"[Explain] Writing MD   to: {out_md}")
 
-        from explain.pipeline import generate_explanations
-        _ = generate_explanations(
-            args=args,
-            dataset=args.data,
-            test_scores=chosen['scores'],
-            predict=chosen['predict'],
-            test_pred_results=test_pred_results,
-            test_ae_results=test_ae_results,
-            test_generate_results=test_generate_results,
-            option=2,
-            method=best_method,
-            threshold=chosen_th,
-            out_json_path=out_json,
-            out_md_path=out_md,
-        )
+                from explain.pipeline import generate_explanations
+                _ = generate_explanations(
+                    args=args,
+                    dataset=args.data,
+                    test_scores=result['scores'],
+                    predict=result['predict'],
+                    test_pred_results=test_pred_results,
+                    test_ae_results=test_ae_results,
+                    test_generate_results=test_generate_results,
+                    option=2,
+                    method=method_name,
+                    threshold=method_th,
+                    out_json_path=out_json,
+                    out_md_path=out_md,
+                )
 
-        print(f"[Explain] Done. Explained segments: {_.get('num_segments', 0)}")
+                print(f"[Explain] Done. Explained segments: {_.get('num_segments', 0)}")
+        else:
+            out_json = args.explain_out_json or os.path.join(args.log_dir, f"explanations_{args.data}_{best_method}.json")
+            out_md = args.explain_out_md or os.path.join(args.log_dir, f"explanations_{args.data}_{best_method}.md")
+
+            print(f"\n[Explain] Using method={best_method}, threshold={chosen_th:.6f}")
+            print(f"[Explain] Writing JSON to: {out_json}")
+            print(f"[Explain] Writing MD   to: {out_md}")
+
+            from explain.pipeline import generate_explanations
+            _ = generate_explanations(
+                args=args,
+                dataset=args.data,
+                test_scores=chosen['scores'],
+                predict=chosen['predict'],
+                test_pred_results=test_pred_results,
+                test_ae_results=test_ae_results,
+                test_generate_results=test_generate_results,
+                option=2,
+                method=best_method,
+                threshold=chosen_th,
+                out_json_path=out_json,
+                out_md_path=out_md,
+            )
+
+            print(f"[Explain] Done. Explained segments: {_.get('num_segments', 0)}")
 
 
 if __name__ == '__main__':

@@ -189,7 +189,7 @@ def bf_search(score, label, start, end=None, step_num=1, display_freq=1, verbose
         step_num = 1
     search_step, search_range, search_lower_bound = step_num, end - start, start
     if verbose:
-        print("search range: ", search_lower_bound, search_lower_bound + search_range)
+        print("search range: ", search_lower_bound, search_lower_bound + search_range, flush=True)
     threshold = search_lower_bound
     m = (-1., -1., -1.)
     m_t = 0.0
@@ -202,8 +202,9 @@ def bf_search(score, label, start, end=None, step_num=1, display_freq=1, verbose
             m = target
             m_predict = predict
         if verbose and i % display_freq == 0:
-            print("cur thr: ", threshold, target, m, m_t)
-    print(m, m_t)
+            # Keep log friendly: one line per display step and flush immediately.
+            print(f"cur thr: {threshold} {target} best={m} best_thr={m_t}", flush=True)
+    print(m, m_t, flush=True)
     return m, m_t, m_predict
 
 
@@ -425,15 +426,22 @@ def get_graph_weight(pred_model, nnodes,
     return sort_weight_out[:target_num], sort_weight_in[:target_num]
 
 
-def get_score_weight(test_pred_results, test_ae_results, test_generate_results, y_test_labels, topk=1, option=1,
+def get_score_weight(test_pred_results, test_ae_results, test_generate_results, y_test_labels, topk=1, topk_agg='sum', option=1,
                      method="max", alpha=0.4, beta=0.3, gamma=0.3, target_num=10):
-    test_scores, total_topk_err_scores = get_score_PredAndAE(test_pred_results, test_ae_results, test_generate_results,
-                                                             topk=topk, topk_agg=topk_agg, option=option,
-                                                             method=method, alpha=alpha, beta=beta,
-                                                             gamma=gamma)  # Obtain feature importance through the anomaly scores
+    test_scores, total_topk_err_scores = get_score_PredAndAE(
+        test_pred_results,
+        test_ae_results,
+        test_generate_results,
+        topk=topk,
+        topk_agg=topk_agg,
+        option=option,
+        method=method,
+        alpha=alpha,
+        beta=beta,
+        gamma=gamma,
+    )  # Obtain feature importance through the anomaly scores
 
     score_weight = np.mean(test_scores, axis=1)  # (nodes)
     sort_score_weight = np.array(score_weight).argsort()[::-1]  # ranking
 
     return sort_score_weight[:target_num]
-

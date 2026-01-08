@@ -47,6 +47,7 @@
             <excludedPath path="/dataset" />
             <excludedPath path="/tmp" />
             <excludedPath path="/expe/pth" />
+            <excludedPath path="/log" />
           </excludedPaths>
         </serverdata>
       </paths>

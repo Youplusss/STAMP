@@ -4,8 +4,12 @@ from __future__ import annotations
 import os
 import json
 from typing import Any, Dict, List, Optional
+import sys
 
 import numpy as np
+
+# NEW: progress bar for long LLM explanation runs
+from tqdm import tqdm
 
 from .segment import build_segments_from_predictions
 from .statistics import describe_univariate_window, series_patch_prototypes, summarize_values
@@ -186,11 +190,30 @@ def generate_explanations(
         hf_endpoint=hf_endpoint,
         cache_dir=hf_cache_dir,
         force_gpu=explain_force_gpu,
+        hf_load_in_4bit=bool(getattr(args, 'explain_hf_load_in_4bit', False)),
+        hf_load_in_8bit=bool(getattr(args, 'explain_hf_load_in_8bit', False)),
     )
 
     explanations: List[Dict[str, Any]] = []
 
-    for seg in segments:
+    # Progress display modes:
+    # - TTY interactive: use tqdm bar (no log garbage)
+    # - non-TTY (nohup/redirect): print occasional one-line updates suitable for `tail -f`
+    show_bar_flag = bool(getattr(args, 'explain_progress', True))
+    log_every = int(getattr(args, 'explain_log_progress_every', 1))
+
+    is_tty = False
+    try:
+        is_tty = hasattr(sys.stderr, 'isatty') and sys.stderr.isatty()
+    except Exception:
+        is_tty = False
+
+    use_tqdm = bool(show_bar_flag and is_tty)
+
+    seg_iter = tqdm(segments, desc='Explain segments', total=len(segments), disable=(not use_tqdm), file=sys.stderr)
+
+    total_seg = len(segments)
+    for seg_i, seg in enumerate(seg_iter, 1):
         # segment-level feature importance
         seg_scores = np.mean(test_scores[:, seg.start:seg.end + 1], axis=1)  # (F,)
         feat_rank = np.argsort(seg_scores)[::-1]
@@ -295,7 +318,18 @@ def generate_explanations(
             "global": global_evidence,
             "features": feature_evidence,
         }
+
+        if use_tqdm:
+            seg_iter.set_postfix({"peak": int(seg.peak), "len": int(seg.end - seg.start + 1)})
+        elif show_bar_flag and (log_every > 0) and (seg_i == 1 or seg_i % log_every == 0 or seg_i == total_seg):
+            # Log-friendly progress line (no tqdm control chars)
+            print(f"[Explain][Progress] {seg_i}/{total_seg} peak={int(seg.peak)} len={int(seg.end - seg.start + 1)}", flush=True)
+
         explanation_text = explainer.explain(prompt, evidence_payload)
+
+        # Optional: after completion of this segment, print a 'done' marker for tail -f
+        if (not use_tqdm) and show_bar_flag and (log_every > 0) and (seg_i == 1 or seg_i % log_every == 0 or seg_i == total_seg):
+            print(f"[Explain][Progress] done {seg_i}/{total_seg}", flush=True)
 
         explanations.append({
             "segment": segment_info,
@@ -330,21 +364,92 @@ def generate_explanations(
         md_lines.append(f"- method: {method}, option: {option}, threshold: {threshold}")
         md_lines.append("")
 
+        # One-time legend for evidence fields
+        md_lines.append("## Legend (字段说明)")
+        md_lines.append("- **feature/sensor_X**: 变量/传感器编号（仅是索引映射，不代表物理含义）")
+        md_lines.append("- **contrib**: 该变量在本异常段内的相对贡献度（Top-K 内归一化，越大越可疑）")
+        md_lines.append("- **score**: 本方法下该变量的异常分数（越大越异常）")
+        md_lines.append("- **pattern/dir**: 该变量在峰值窗口内的形态（如 spike/level_shift/oscillation）与方向")
+        md_lines.append("- **min/max/last**: 峰值窗口内该变量的最小/最大/末尾值（来自原始窗口序列）")
+        md_lines.append("")
+
+        def _root_cause_and_actions(feature_rows: List[Dict[str, Any]]) -> Dict[str, List[str]]:
+            """Heuristic root-cause suggestions based on evidence only (no domain semantics)."""
+            causes: List[str] = []
+            actions: List[str] = []
+
+            types = [str((r.get('pattern') or {}).get('anomaly_type', 'unknown')) for r in feature_rows]
+            if any(t in ('level_shift_up', 'level_shift_down') for t in types):
+                causes.append("出现水平漂移（level shift）：可能是系统工况切换、标定变化、或传感器偏置变化。")
+                actions.append("核对该时间段是否有操作/工况切换/配置变更；对比异常前后均值是否整体抬升/下降。")
+            if any(t == 'spike' for t in types):
+                causes.append("出现尖峰（spike）：可能是瞬时噪声、采样抖动、或短暂外部扰动。")
+                actions.append("检查原始数据是否有单点尖峰/丢包补零；查看同一时刻是否多变量同步尖峰。")
+            if any(t == 'variance_increase' for t in types):
+                causes.append("波动增大（variance increase）：可能是系统进入不稳定状态或噪声增加。")
+                actions.append("对比异常前后方差/振幅；检查是否存在控制环震荡或负载变化。")
+            if any(t == 'oscillation' for t in types):
+                causes.append("出现振荡（oscillation）：可能是控制回路震荡、周期性扰动或反馈异常。")
+                actions.append("检查是否存在周期性模式；对齐控制日志/告警，定位是否有周期控制动作。")
+
+            if not causes:
+                causes.append("形态未能明确归类：可能为多因素耦合异常或证据不足。")
+                actions.append("优先检查贡献度最高的变量；结合日志/告警进一步定位。")
+
+            # Always include a cross-variable check
+            actions.append("建议：查看 Top-K 变量之间的相关性是否在该异常段发生显著变化（耦合异常线索）。")
+
+            return {"causes": causes, "actions": actions}
+
         for k, item in enumerate(explanations, 1):
             seg = item['segment']
             md_lines.append(f"## Case {k}: window[{seg['start']},{seg['end']}], peak={seg['peak']}")
             md_lines.append("")
 
-            md_lines.append("### LLM / Template Explanation")
-            md_lines.append(item['explanation'])
+            # Explanation
+            md_lines.append("### Explanation")
+            exp_text = str(item.get('explanation', '')).strip()
+            if exp_text:
+                for line in exp_text.splitlines():
+                    md_lines.append(f"> {line}" if line.strip() else ">")
+            else:
+                md_lines.append("> <EMPTY>")
             md_lines.append("")
 
+            # Root cause & actions (heuristic)
+            md_lines.append("### Root Cause (推测) & Suggested Actions (建议)")
+            rca = _root_cause_and_actions(item.get('feature_evidence', []))
+            md_lines.append("**可能根因：**")
+            for c in rca["causes"]:
+                md_lines.append(f"- {c}")
+            md_lines.append("**建议处理：**")
+            for a in rca["actions"]:
+                md_lines.append(f"- {a}")
+            md_lines.append("")
+
+            # Evidence table
             md_lines.append("### Top Feature Evidence")
-            for fe in item['feature_evidence']:
-                md_lines.append(f"- **{fe['name']}** (idx={fe['index']}), contrib={fe['contribution']:.3f}, score={fe['score']:.4f}")
-                md_lines.append(f"  - pattern: {fe['pattern']['anomaly_type']} ({fe['pattern']['direction']})")
-                md_lines.append(f"  - stats: min={fe['stats']['min']:.3f}, max={fe['stats']['max']:.3f}, last={fe['stats']['last']:.3f}")
-                md_lines.append(f"  - shape_tokens: {' '.join(fe.get('shape_tokens', []))}")
+            md_lines.append("| rank | feature | idx | contrib | score | pattern | dir | min | max | last |")
+            md_lines.append("|---:|---|---:|---:|---:|---|---|---:|---:|---:|")
+            for i, fe in enumerate(item['feature_evidence'], 1):
+                pat = fe.get('pattern', {}) or {}
+                stats = fe.get('stats', {}) or {}
+                md_lines.append(
+                    "| {rank} | {name} | {idx} | {contrib:.3f} | {score:.4f} | {atype} | {adir} | {minv:.3f} | {maxv:.3f} | {lastv:.3f} |".format(
+                        rank=i,
+                        name=fe.get('name', ''),
+                        idx=int(fe.get('index', -1)),
+                        contrib=float(fe.get('contribution', 0.0)),
+                        score=float(fe.get('score', 0.0)),
+                        atype=str(pat.get('anomaly_type', 'unknown')),
+                        adir=str(pat.get('direction', 'unknown')),
+                        minv=float(stats.get('min', 0.0)),
+                        maxv=float(stats.get('max', 0.0)),
+                        lastv=float(stats.get('last', 0.0)),
+                    )
+                )
+            md_lines.append("")
+            md_lines.append("---")
             md_lines.append("")
 
         with open(out_md_path, 'w', encoding='utf-8') as f:

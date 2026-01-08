@@ -7,7 +7,15 @@ import networkx as nx
 from sklearn.metrics import roc_curve,roc_auc_score
 
 import os
-base_dir = os.getcwd()
+# Default output root for plots. Using cwd() is fragile because users often run scripts
+# from the repo root, which would dump PDFs next to run.py. Prefer expe/pdf.
+try:
+    from lib.paths import resolve_experiment_dirs
+    _exp = resolve_experiment_dirs('expe')
+    base_dir = _exp.pdf_dir
+except Exception:
+    # fallback to current working directory
+    base_dir = os.getcwd()
 
 def get_default_device():
     """Pick GPU if available, else CPU"""
