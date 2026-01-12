@@ -10,9 +10,7 @@ import pandas as pd
 
 from tqdm import tqdm
 
-from lib.adv_losses import ramp_weight, pred_total_loss, ae_total_loss
-
-
+from lib.adv_losses import ramp_weight, pred_total_loss, ae_total_loss, energy_transform
 def _progress(iterable, *, desc: str, total: Optional[int] = None, leave: bool = False, disable: bool = False):
     return tqdm(iterable, desc=desc, total=total, leave=leave, dynamic_ncols=True, disable=disable)
 
@@ -44,27 +42,29 @@ class Trainer(object):
         if val_loader != None:
             self.val_per_epoch = len(val_loader)
 
-        # ---- experiment dirs (standard: expe/{pth,log,pdf}) ----
-        pth_dir = getattr(self.args, 'log_dir_pth', None) or os.path.join(self.args.log_dir, 'pth')
-        os.makedirs(pth_dir, exist_ok=True)
-        self.best_path = os.path.join(pth_dir, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
+        # Output dirs: prefer explicit subdirs (expe/pth, expe/log) when available
+        self.ckpt_dir = getattr(self.args, 'log_dir_pth', None) or self.args.log_dir
+        self.log_dir = getattr(self.args, 'log_dir_log', None) or self.args.log_dir
 
-        # transfer path
-        log_dir_transfer = getattr(self.args, 'log_dir_transfer', None) or self.args.log_dir
-        transfer_pth_dir = getattr(self.args, 'log_dir_pth', None) or os.path.join(log_dir_transfer, 'pth')
-        os.makedirs(transfer_pth_dir, exist_ok=True)
-        self.transfer_path = os.path.join(transfer_pth_dir, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
+        self.best_path = os.path.join(self.ckpt_dir, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
+        # self.best_path = os.path.join(self.args.log_dir, 'best_model_unsup_weights_init_' + self.args.data + "_" + self.args.model + '.pth') #用该版本读取无监督节点权重
+        # log_dir_transfer 在原始仓库里并非所有脚本都显式定义，这里做兼容处理
+        log_dir_transfer = getattr(self.args, 'log_dir_transfer', None) or self.ckpt_dir
+        self.transfer_path = os.path.join(log_dir_transfer, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
+        self.loss_figure_path = os.path.join(self.args.log_dir, 'loss.png')
 
-        self.loss_figure_path = os.path.join(getattr(self.args, 'log_dir_pdf', self.args.log_dir), 'loss.png')
-
-        # ---- log ----
-        log_root = getattr(args, 'log_dir_log', None) or os.path.join(args.log_dir, 'log')
-        os.makedirs(log_root, exist_ok=True)
-        self.logger = get_logger(log_root, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=getattr(args, 'run_id', None), console=True)
-        self.logger.info('Experiment log path in: {}'.format(log_root))
+        ## log
+        if os.path.isdir(self.log_dir) == False and not args.debug:
+            os.makedirs(self.log_dir, exist_ok=True)
+        self.logger = get_logger(self.log_dir, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=getattr(args, 'run_id', None), console=True)
+        # self.logger = get_logger(args.log_dir, name=args.model + '_unsup', debug=args.debug, data = args.data)
+        self.logger.info('Experiment log path in: {}'.format(self.log_dir))
 
         # fix: accidental whitespace split in attribute names
         self.ae_channels = self.args.window_size * self.args.nnodes * self.args.in_channels
+
+        # BEGAN-style equilibrium variable (used only when adv_mode == 'began')
+        self._began_k = float(getattr(self.args, 'adv_began_k_init', 0.0))
 
     def pred_model_batch(self, batch, training=True, mas = None):
         self.pred_model.train(training)
@@ -129,6 +129,34 @@ class Trainer(object):
     def _adv_tau(self) -> float:
         return float(getattr(self.args, 'adv_tau', 1.0))
 
+    def _adv_pred_objective(self) -> str:
+        # pred branch coupling objective (see lib/adv_losses.py)
+        return str(getattr(self.args, 'adv_pred_objective', 'adv')).lower()
+
+    def _adv_margin_floor(self) -> float:
+        return float(getattr(self.args, 'adv_margin_floor', 0.0))
+
+    def _adv_margin_high(self) -> float:
+        return float(getattr(self.args, 'adv_margin_high', -1.0))
+
+    def _adv_tau_mode(self) -> str:
+        return str(getattr(self.args, 'adv_tau_mode', 'abs')).lower()
+
+    def _adv_tau_floor(self) -> float:
+        return float(getattr(self.args, 'adv_tau_floor', 1e-4))
+
+    def _adv_energy_transform(self) -> str:
+        return str(getattr(self.args, 'adv_energy_transform', 'none')).lower()
+
+    def _adv_auto_balance(self) -> bool:
+        return bool(getattr(self.args, 'adv_auto_balance', False))
+
+    def _began_gamma(self) -> float:
+        return float(getattr(self.args, 'adv_began_gamma', 0.5))
+
+    def _began_lambda_k(self) -> float:
+        return float(getattr(self.args, 'adv_began_lambda_k', 0.001))
+
     def _adv_lambdas(self, epoch: int) -> tuple[float, float]:
         """Return (lambda_pred, lambda_ae) for current epoch.
 
@@ -185,6 +213,15 @@ class Trainer(object):
         adv_margin = self._adv_margin()
         adv_margin_mode = self._adv_margin_mode()
         adv_tau = self._adv_tau()
+        adv_pred_obj = self._adv_pred_objective()
+        adv_margin_floor = self._adv_margin_floor()
+        adv_margin_high = self._adv_margin_high()
+        adv_tau_mode = self._adv_tau_mode()
+        adv_tau_floor = self._adv_tau_floor()
+        adv_energy_tr = self._adv_energy_transform()
+        adv_auto_balance = self._adv_auto_balance()
+        began_gamma = self._began_gamma()
+        began_lambda_k = self._began_lambda_k()
         lam_pred, lam_ae = self._adv_lambdas(epoch)
 
         total_val_pred_loss_list = []
@@ -253,16 +290,45 @@ class Trainer(object):
                         loss1 = float((a * pred_loss + b * adv_loss).item())
                         loss2 = float((c * ae_loss - d * adv_loss).item())
                     else:
-                        loss1 = float(pred_total_loss(pred_loss, adv_loss, lam_pred).item())
-                        loss2_t, _, _, _ = ae_total_loss(
-                            ae_loss,
+                        loss1_t, _, _ = pred_total_loss(
+                            pred_loss,
                             adv_loss,
-                            mode=adv_mode,  # type: ignore[arg-type]
-                            lambda_ae=lam_ae,
+                            lam_pred,
+                            real_recon_loss=ae_loss,
+                            pred_objective=adv_pred_obj,
                             margin=adv_margin,
                             margin_mode=adv_margin_mode,  # type: ignore[arg-type]
+                            margin_floor=adv_margin_floor,
+                            margin_high=adv_margin_high,
                             tau=adv_tau,
+                            tau_mode=adv_tau_mode,
+                            tau_floor=adv_tau_floor,
+                            energy_transform_mode=adv_energy_tr,
+                            auto_balance=adv_auto_balance,
                         )
+                        loss1 = float(loss1_t.item())
+
+                        if adv_mode == 'began':
+                            # BEGAN-style logging loss (do NOT update k in validation)
+                            E_fake = energy_transform(adv_loss, adv_energy_tr)
+                            k = float(getattr(self, '_began_k', 0.0))
+                            loss2_t = ae_loss - (lam_ae * k) * E_fake
+                        else:
+                            loss2_t, _, _, _, _ = ae_total_loss(
+                                ae_loss,
+                                adv_loss,
+                                mode=adv_mode,  # type: ignore[arg-type]
+                                lambda_ae=lam_ae,
+                                margin=adv_margin,
+                                margin_mode=adv_margin_mode,  # type: ignore[arg-type]
+                                margin_floor=adv_margin_floor,
+                                margin_high=adv_margin_high,
+                                tau=adv_tau,
+                                tau_mode=adv_tau_mode,
+                                tau_floor=adv_tau_floor,
+                                energy_transform_mode=adv_energy_tr,
+                                auto_balance=adv_auto_balance,
+                            )
                         loss2 = float(loss2_t.item())
 
                 loss1_list.append(loss1)
@@ -302,6 +368,16 @@ class Trainer(object):
         adv_margin_mode = self._adv_margin_mode()
         adv_tau = self._adv_tau()
         lam_pred, lam_ae = self._adv_lambdas(epoch)
+
+        adv_pred_obj = self._adv_pred_objective()
+        adv_margin_floor = self._adv_margin_floor()
+        adv_margin_high = self._adv_margin_high()
+        adv_tau_mode = self._adv_tau_mode()
+        adv_tau_floor = self._adv_tau_floor()
+        adv_energy_tr = self._adv_energy_transform()
+        adv_auto_balance = self._adv_auto_balance()
+        began_gamma = self._began_gamma()
+        began_lambda_k = self._began_lambda_k()
 
         loss1_list = []
         loss2_list = []
@@ -475,14 +551,39 @@ class Trainer(object):
             out, tgt, gen = self.pred_model_batch(batch, training=True, mas=mas)
             pred_loss = self.pred_loss(out, tgt)
 
+            # compute AE recon on generated window (and optionally on real window)
+            # We freeze AE *parameters* during pred update (if adv_freeze_other=True),
+            # but keep gradients w.r.t. AE inputs so pred can receive adversarial gradients.
             if adv_freeze_other:
                 _set_requires_grad(self.ae_model, False)
+
             recon_gen_flat, gen_flat = self.ae_model_batch(gen, training=True)
+            adv_loss = self._recon_loss_from_flat(recon_gen_flat, gen_flat, scope=adv_scope)
+
+            # optional: use real reconstruction loss to define a *gap*-based generator objective
+            real_recon_for_pred = None
+            if adv_pred_obj != 'adv':
+                recon_real_flat_p, real_flat_p = self.ae_model_batch(batch, training=True)
+                real_recon_for_pred = self._recon_loss_from_flat(recon_real_flat_p, real_flat_p, scope='full').detach()
+
             if adv_freeze_other:
                 _set_requires_grad(self.ae_model, True)
 
-            adv_loss = self._recon_loss_from_flat(recon_gen_flat, gen_flat, scope=adv_scope)
-            loss1_t = pred_total_loss(pred_loss, adv_loss, lam_pred)
+            loss1_t, _, _ = pred_total_loss(
+                pred_loss,
+                adv_loss,
+                lam_pred,
+                real_recon_loss=real_recon_for_pred,
+                pred_objective=adv_pred_obj,
+                margin=adv_margin,
+                margin_mode=adv_margin_mode,
+                margin_floor=adv_margin_floor,
+                tau=adv_tau,
+                tau_mode=adv_tau_mode,
+                tau_floor=adv_tau_floor,
+                energy_transform_mode=adv_energy_tr,
+                auto_balance=adv_auto_balance,
+            )
             loss1_t.backward()
             if do_clip and max_grad_norm_pred > 0:
                 torch.nn.utils.clip_grad_norm_(self.pred_model.parameters(), max_grad_norm_pred)
@@ -498,15 +599,35 @@ class Trainer(object):
             recon_gen_flat2, gen_flat2 = self.ae_model_batch(gen_det, training=True)
             adv_loss2 = self._recon_loss_from_flat(recon_gen_flat2, gen_flat2, scope=adv_scope)
 
-            loss2_t, penalty_t, gap_t, _ = ae_total_loss(
-                ae_loss,
-                adv_loss2,
-                mode=adv_mode,  # type: ignore[arg-type]
-                lambda_ae=lam_ae,
-                margin=adv_margin,
-                margin_mode=adv_margin_mode,  # type: ignore[arg-type]
-                tau=adv_tau,
-            )
+            if adv_mode == 'began':
+                # BEGAN-style discriminator update: L = L_real - k * E_fake
+                E_real = energy_transform(ae_loss, adv_energy_tr)
+                E_fake = energy_transform(adv_loss2, adv_energy_tr)
+                k = float(getattr(self, '_began_k', 0.0))
+                loss2_t = ae_loss - (lam_ae * k) * E_fake
+                penalty_t = -(lam_ae * k) * E_fake
+                gap_t = E_fake - E_real
+
+                # update k (no grad): keep E_fake close to gamma * E_real
+                with torch.no_grad():
+                    delta = float(began_gamma) * float(E_real.detach().item()) - float(E_fake.detach().item())
+                    self._began_k = float(min(1.0, max(0.0, k + float(began_lambda_k) * delta)))
+            else:
+                loss2_t, penalty_t, gap_t, _, _ = ae_total_loss(
+                    ae_loss,
+                    adv_loss2,
+                    mode=adv_mode,  # type: ignore[arg-type]
+                    lambda_ae=lam_ae,
+                    margin=adv_margin,
+                    margin_mode=adv_margin_mode,  # type: ignore[arg-type]
+                    margin_floor=adv_margin_floor,
+                    margin_high=adv_margin_high,
+                    tau=adv_tau,
+                    tau_mode=adv_tau_mode,
+                    tau_floor=adv_tau_floor,
+                    energy_transform_mode=adv_energy_tr,
+                    auto_balance=adv_auto_balance,
+                )
             loss2_t.backward()
             if do_clip and max_grad_norm_ae > 0:
                 torch.nn.utils.clip_grad_norm_(self.ae_model.parameters(), max_grad_norm_ae)
@@ -516,12 +637,15 @@ class Trainer(object):
             loss2_list.append(float(loss2_t.item()))
 
             # concise progress display
-            pbar.set_postfix({
+            postfix = {
                 'L1': f"{loss1_t.item():.4f}",
                 'L2': f"{loss2_t.item():.4f}",
                 'adv': f"{adv_loss.item():.4f}",
                 'gap': f"{gap_t.item():+.4f}",
-            })
+            }
+            if adv_mode == 'began':
+                postfix['k'] = f"{float(getattr(self, '_began_k', 0.0)):.3f}"
+            pbar.set_postfix(postfix)
 
         end_time = time.time()
 
@@ -810,15 +934,17 @@ class PredictedModelTrainer(object):
         if val_loader != None:
             self.val_per_epoch = len(val_loader)
 
-        pth_dir = getattr(self.args, 'log_dir_pth', None) or os.path.join(self.args.log_dir, 'pth')
-        os.makedirs(pth_dir, exist_ok=True)
-        self.best_path = os.path.join(pth_dir, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
-        self.loss_figure_path = os.path.join(getattr(self.args, 'log_dir_pdf', self.args.log_dir), 'loss.png')
+        ckpt_dir = getattr(self.args, 'log_dir_pth', None) or self.args.log_dir
+        log_dir = getattr(self.args, 'log_dir_log', None) or self.args.log_dir
+        self.best_path = os.path.join(ckpt_dir,
+                                      'best_model_' + self.args.data + "_" + self.args.model + '.pth')
+        self.loss_figure_path = os.path.join(self.args.log_dir, 'loss.png')
 
-        log_root = getattr(args, 'log_dir_log', None) or os.path.join(args.log_dir, 'log')
-        os.makedirs(log_root, exist_ok=True)
-        self.logger = get_logger(log_root, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=getattr(args, 'run_id', None), console=True)
-        self.logger.info('Experiment log path in: {}'.format(log_root))
+        ## log
+        if os.path.isdir(log_dir) == False and not args.debug:
+            os.makedirs(log_dir, exist_ok=True)
+        self.logger = get_logger(log_dir, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=getattr(args, 'run_id', None), console=True)
+        self.logger.info('Experiment log path in: {}'.format(log_dir))
 
     def pred_model_batch(self, batch, training=True, mas=None):
         self.pred_model.train(training)
@@ -982,76 +1108,6 @@ class PredictedModelTrainer(object):
         self.logger.info("Saving current best model to " + self.best_path)
 
 
-class PredTester(object):
-    def __init__(self, pred_model, args, scaler, logger, path=None):
-        self.pred_model = pred_model
-        self.args = args
-        self.scaler = scaler
-        self.logger = logger
-        self.path = path
-
-    def testing(self, data_loader, map_location=None):
-        if self.path != None:
-            print("load model: ", self.path)
-            check_point = torch.load(self.path, map_location=map_location, weights_only=False)
-            pred_state_dict = check_point['pred_state_dict']
-            # args = check_point['config']
-            self.pred_model.load_state_dict(pred_state_dict)
-
-            self.pred_model.to(self.args.device)
-
-        self.pred_model.eval()
-
-        scores = []
-        gt_list = []
-        pred_list = []
-
-        pred_channels = self.args.n_pred * self.args.nnodes * self.args.out_channels
-
-        with torch.no_grad():
-            pbar = _progress(
-                data_loader,
-                desc="Test",
-                total=len(data_loader) if hasattr(data_loader, '__len__') else None,
-                leave=False,
-                disable=bool(getattr(self.args, 'debug', False)),
-            )
-            for batch_m in pbar:
-                if self.args.is_mas:
-                    batch, mas = batch_m
-                    batch = batch.to(self.args.device, non_blocking=True)
-                    mas = mas.to(self.args.device, non_blocking=True)
-                    mas = mas[:, :self.args.window_size - self.args.n_pred, ...]
-                else:
-                    batch, mas = batch_m[0], None
-                    batch = batch.to(self.args.device, non_blocking=True)
-
-                x, target = batch[:, :self.args.window_size - self.args.n_pred, ...], batch[:, -self.args.n_pred:, ...]
-                output = self.pred_model(x, mas=mas)
-
-                if self.args.real_value:
-                    target = self.scaler.inverse_transform(target.reshape(-1, self.args.n_pred,
-                                                                          self.args.nnodes * self.args.out_channels).detach().cpu().numpy())
-                    target = torch.from_numpy(target).float().view(-1, self.args.n_pred, self.args.nnodes,
-                                                                   self.args.out_channels).to(batch.device)
-
-                score = torch.mean((output.reshape(-1, pred_channels) - target.reshape(-1, pred_channels)) ** 2,
-                                   axis=1)
-
-                scores.append(score.detach().cpu().numpy())
-
-                gt_list.append(target.reshape(-1, self.args.n_pred,
-                                              self.args.nnodes * self.args.out_channels).detach().cpu().numpy())
-                pred_list.append(output.reshape(-1, self.args.n_pred,
-                                                self.args.nnodes * self.args.out_channels).detach().cpu().numpy())
-
-                pbar.set_postfix({
-                    'mse': f"{float(score.mean().item()):.4f}"
-                })
-
-        return scores, pred_list, gt_list
-
-
 class AEModelTrainer(object):
     def __init__(self, ae_model, ae_loss, ae_optimizer, train_loader, val_loader, test_loader, args, scaler,
                  lr_scheduler=None):
@@ -1067,17 +1123,17 @@ class AEModelTrainer(object):
         self.scaler = scaler
         self.lr_scheduler = lr_scheduler
 
-        pth_dir = getattr(self.args, 'log_dir_pth', None) or os.path.join(self.args.log_dir, 'pth')
-        os.makedirs(pth_dir, exist_ok=True)
-        self.best_path = os.path.join(pth_dir, 'best_model_' + self.args.data + "_" + self.args.model + '.pth')
-        self.loss_figure_path = os.path.join(getattr(self.args, 'log_dir_pdf', self.args.log_dir), 'loss.png')
+        ckpt_dir = getattr(self.args, 'log_dir_pth', None) or self.args.log_dir
+        log_dir = getattr(self.args, 'log_dir_log', None) or self.args.log_dir
+        self.best_path = os.path.join(ckpt_dir,
+                                      'best_model_' + self.args.data + "_" + self.args.model + '.pth')
+        self.loss_figure_path = os.path.join(self.args.log_dir, 'loss.png')
 
-        log_root = getattr(args, 'log_dir_log', None) or os.path.join(args.log_dir, 'log')
-        os.makedirs(log_root, exist_ok=True)
-        self.logger = get_logger(log_root, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=getattr(args, 'run_id', None), console=True)
-        self.logger.info('Experiment log path in: {}'.format(log_root))
-
-        self.ae_channels = self.args.window_size * self.args.nnodes * self.args.in_channels
+        ## log
+        if os.path.isdir(log_dir) == False and not args.debug:
+            os.makedirs(log_dir, exist_ok=True)
+        self.logger = get_logger(log_dir, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=getattr(args, 'run_id', None), console=True)
+        self.logger.info('Experiment log path in: {}'.format(log_dir))
 
     def ae_model_batch(self, batch, training=True):
         self.ae_model.train(training)

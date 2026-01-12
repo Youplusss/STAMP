@@ -96,15 +96,42 @@ def build_arg_parser() -> argparse.ArgumentParser:
                         help='where to compute adversarial reconstruction loss on generated window: '
                              'full=whole window; pred=only last n_pred steps (recommended); history=only context part.')
     parser.add_argument('--adv_mode', type=str, default='legacy',
-                        choices=['legacy', 'hinge', 'softplus', 'exp'],
+                        choices=['legacy', 'hinge', 'band', 'softplus', 'softplus0', 'exp', 'began'],
                         help='AE adversarial objective. legacy: ae_loss - lambda*adv_loss (can be unstable). '
-                             'hinge/softplus/exp are bounded variants (recommended for Mamba).')
+                             'hinge/softplus0/softplus/exp are bounded variants (recommended for Mamba). began is a BEGAN-style equilibrium variant.')
     parser.add_argument('--adv_margin', type=float, default=0.1,
                         help='margin value used by hinge/softplus modes. See trainer.py/lib/adv_losses.py for definition.')
+    parser.add_argument('--adv_margin_high', type=float, default=-1.0,
+                        help='upper margin for adv_mode=band (two-sided hinge). If <=0, band mode is invalid.')
     parser.add_argument('--adv_margin_mode', type=str, default='rel', choices=['abs', 'rel'],
                         help='margin type: abs => adv_loss >= ae_loss + margin; rel => adv_loss >= (1+margin)*ae_loss (scale-invariant).')
     parser.add_argument('--adv_tau', type=float, default=1.0,
                         help='temperature for softplus/exp modes (smoother gradients).')
+
+    # --- extra stabilizers / knobs (v2) ---
+    parser.add_argument('--adv_pred_objective', type=str, default='adv',
+                        choices=['adv', 'gap_relu', 'gap_hinge'],
+                        help='how the pred branch uses the AE signal. adv: add adv_loss; '
+                             'gap_relu: penalize positive (adv-ae); gap_hinge: penalize (adv-ae-margin) when too large.')
+    parser.add_argument('--adv_margin_floor', type=float, default=0.0,
+                        help='a minimum absolute margin added on top of rel margin (helps when ae_loss is tiny).')
+    parser.add_argument('--adv_tau_mode', type=str, default='abs', choices=['abs', 'rel'],
+                        help='temperature scaling for softplus/softplus0/exp: abs=tau, rel=tau*ae_loss_detached (scale-invariant).')
+    parser.add_argument('--adv_tau_floor', type=float, default=1e-4,
+                        help='minimum temperature value to avoid numerical issues when tau_mode=rel and ae_loss is tiny.')
+    parser.add_argument('--adv_energy_transform', type=str, default='none', choices=['none', 'log1p', 'sqrt'],
+                        help='apply a transform to reconstruction energies before adversarial comparisons (stabilizes large adv_loss).')
+    parser.add_argument('--adv_auto_balance', type=eval, default=False,
+                        help='auto-rescale adversarial weights so adv terms do not dominate base losses (recommended if you see divergence).')
+
+    # BEGAN-style equilibrium (only used when --adv_mode began)
+    parser.add_argument('--adv_began_gamma', type=float, default=0.5,
+                        help='target ratio for BEGAN equilibrium: E_fake ~= gamma * E_real (on transformed energy).')
+    parser.add_argument('--adv_began_lambda_k', type=float, default=0.001,
+                        help='update rate for BEGAN k. Smaller => more stable.')
+    parser.add_argument('--adv_began_k_init', type=float, default=0.0,
+                        help='initial k for BEGAN.')
+
     # weight schedule (warmup + linear ramp) for stabilized strategies
     parser.add_argument('--adv_lambda_pred', type=float, default=1.0,
                         help='max weight for adv_loss in pred update (after warmup+ramp).')
@@ -332,23 +359,28 @@ def main():
     # 名称：v2_mamba / v2_gat...
     args.model = args.model + args.pred_model
 
-    # Resolve experiment directories (expe/{log,pth,pdf})
+    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+
+    # Resolve experiment directories (expe/log, expe/pth, expe/pdf)
     from lib.paths import resolve_experiment_dirs
     exp = resolve_experiment_dirs(args.log_dir)
     args.run_id = exp.run_id
     args.log_dir = exp.root
-    # compatibility fields used across the repo
-    args.log_dir_transfer = args.log_dir_transfer or exp.root
     args.log_dir_log = exp.log_dir
     args.log_dir_pth = exp.pth_dir
     args.log_dir_pdf = exp.pdf_dir
-
-    os.environ["CUDA_VISIBLE_DEVICES"] = args.gpu_id
+    # keep transfer dir consistent unless user overrides
+    if getattr(args, 'log_dir_transfer', None) in (None, '', 'None'):
+        args.log_dir_transfer = exp.pth_dir
 
     from lib.utils import get_default_device, to_device, plot_history, plot_history2
     from lib.metrics import masked_mse_loss
-    from lib.logger import get_logger, log_hparams
     from model.utils import print_model_parameters, init_seed
+
+    # logger (write into expe/log)
+    from lib.logger import get_logger, log_hparams
+    logger = get_logger(exp.log_dir, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=exp.run_id, console=True)
+    log_hparams(logger, args)
 
     # device
     print(torch.cuda.is_available())
@@ -361,6 +393,11 @@ def main():
 
     # infer shape
     infer_and_override_data_shape(args, train_loader)
+
+    # Ensure output dirs exist even in remote/nohup runs
+    os.makedirs(exp.log_dir, exist_ok=True)
+    os.makedirs(exp.pth_dir, exist_ok=True)
+    os.makedirs(exp.pdf_dir, exist_ok=True)
 
     if args.in_channels != args.out_channels:
         msg = (
@@ -417,10 +454,6 @@ def main():
     pred_loss = masked_mse_loss(mask_value=-0.01)
     ae_loss = masked_mse_loss(mask_value=-0.01)
 
-    # logger (write to expe/log; keep tqdm in console)
-    logger = get_logger(args.log_dir_log, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=args.run_id, console=True)
-    log_hparams(logger, args)
-
     # print params
     print_model_parameters(pred_model)
     print_model_parameters(ae_model)
@@ -442,12 +475,14 @@ def main():
         lr_scheduler=None,
     )
 
+    # attach unified logger
+    trainer.logger = logger
+
     train_history, val_history = trainer.train()
 
-    # Always save figures under expe/pdf
-    plot_history(train_history, model=args.model, mode="train", data=args.data, out_dir=args.log_dir_pdf, show=False)
-    plot_history(val_history, model=args.model, mode="val", data=args.data, out_dir=args.log_dir_pdf, show=False)
-    plot_history2(val_history, model=args.model, mode="val", data=args.data, out_dir=args.log_dir_pdf, show=False)
+    plot_history(train_history, model=args.model, mode="train", data=args.data, out_dir=exp.pdf_dir, show=False)
+    plot_history(val_history, model=args.model, mode="val", data=args.data, out_dir=exp.pdf_dir, show=False)
+    plot_history2(val_history, model=args.model, mode="val", data=args.data, out_dir=exp.pdf_dir, show=False)
 
 
 if __name__ == '__main__':

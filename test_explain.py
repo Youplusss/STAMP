@@ -223,6 +223,7 @@ def main():
 
     # logger
     from lib.logger import get_logger, log_hparams
+    from lib.logger import log_test_results
     logger = get_logger(exp.log_dir, name=args.model, debug=args.debug, data=args.data, tag='test', model=args.model, run_id=exp.run_id, console=True)
     log_hparams(logger, args)
 
@@ -301,18 +302,27 @@ def main():
      test_generate_list,
      test_generate_construct_list) = concate_results(test_results)
 
+    # Build result tuples for scoring/explanation APIs
+    # Shapes (typical):
+    # - test_pred_list/test_gt_list: (W, n_pred, F)
+    # - test_construct_list/test_origin_list: (W, win, F)
+    # - test_generate_list/test_generate_construct_list: (W, win, F)
+    test_pred_results = [test_pred_list, test_gt_list]
+    test_ae_results = [test_construct_list, test_origin_list]
+    test_generate_results = [test_generate_list, test_generate_construct_list]
+
     print("scores:", len(test_y_pred), float(test_y_pred.mean()))
     print("loss1:", len(test_loss1_list), float(test_loss1_list.mean()))
     print("loss2:", len(test_loss2_list), float(test_loss2_list.mean()))
     print("y_test_labels:", len(y_test_labels))
 
-    test_pred_results = [test_pred_list, test_gt_list]
-    test_ae_results = [test_construct_list, test_origin_list]
-    test_generate_results = [test_generate_list, test_generate_construct_list]
-
+    score_mean = float(test_y_pred.mean())
+    loss1_mean = float(test_loss1_list.mean())
+    loss2_mean = float(test_loss2_list.mean())
 
     # search best f1 under different score aggregation methods
-    results_by_method = {}
+    results_by_method = {}  # method -> info dict (for logging)
+    results_full = {}       # method -> {'info','scores','predict'} (for explanation)
 
     for _method in ["max", "sum", "mean"]:
         print(f"\n================= Find best f1 from score (method={_method}) =================")
@@ -328,30 +338,27 @@ def main():
             search_steps=args.search_steps,
         )
         print(info_m)
-        results_by_method[_method] = {
-            'info': info_m,
-            'scores': test_scores_m,
-            'predict': predict_m,
-        }
+        results_by_method[_method] = info_m
+        results_full[_method] = {'info': info_m, 'scores': test_scores_m, 'predict': predict_m}
 
     # optional: generate explanations
     if args.do_explain:
         use = str(args.explain_use_method).lower()
         if use == 'best':
             best_method = max(
-                results_by_method.keys(),
-                key=lambda k: float(results_by_method[k]['info'].get('best-f1', -1.0))
+                results_full.keys(),
+                key=lambda k: float(results_full[k]['info'].get('best-f1', -1.0))
             )
         else:
             best_method = use
-            if best_method not in results_by_method:
-                raise ValueError(f"Unknown explain_use_method={use}; must be one of {list(results_by_method.keys())} or 'best'.")
+            if best_method not in results_full:
+                raise ValueError(f"Unknown explain_use_method={use}; must be one of {list(results_full.keys())} or 'best'.")
 
-        chosen = results_by_method[best_method]
+        chosen = results_full[best_method]
         chosen_th = float(chosen['info'].get('threshold', 0.0))
 
         if args.explain_all_methods:
-            for method_name, result in results_by_method.items():
+            for method_name, result in results_full.items():
                 out_json = args.explain_out_json or os.path.join(args.log_dir, f"explanations_{args.data}_{method_name}.json")
                 out_md = args.explain_out_md or os.path.join(args.log_dir, f"explanations_{args.data}_{method_name}.md")
 
@@ -402,6 +409,18 @@ def main():
             )
 
             print(f"[Explain] Done. Explained segments: {_.get('num_segments', 0)}")
+
+    # write summary into the test log
+    log_test_results(
+        logger,
+        dataset=args.data,
+        model=args.model,
+        checkpoint_path=model_path,
+        score_mean=score_mean,
+        loss1_mean=loss1_mean,
+        loss2_mean=loss2_mean,
+        best_by_method=results_by_method,
+    )
 
 
 if __name__ == '__main__':

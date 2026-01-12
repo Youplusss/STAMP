@@ -277,6 +277,7 @@ def main():
 
     from lib.utils import get_default_device, concate_results
     from lib.logger import get_logger, log_hparams
+    from lib.logger import log_test_results
     from model.utils import init_seed
 
     # device
@@ -365,9 +366,16 @@ def main():
     print("loss2:", len(test_loss2_list), float(test_loss2_list.mean()))
     print("y_test_labels:", len(y_test_labels))
 
+    # write summary into the test log
+    score_mean = float(test_y_pred.mean())
+    loss1_mean = float(test_loss1_list.mean())
+    loss2_mean = float(test_loss2_list.mean())
+
     test_pred_results = [test_pred_list, test_gt_list]
     test_ae_results = [test_construct_list, test_origin_list]
     test_generate_results = [test_generate_list, test_generate_construct_list]
+
+    best_by_method = {}
 
     # search best f1
     print("================= Find best f1 from score (method=max) =================")
@@ -384,6 +392,7 @@ def main():
         search_steps=args.search_steps,
     )
     print(info)
+    best_by_method['max'] = info
 
     print("\n================= Find best f1 from score (method=sum) =================")
     info, test_scores, predict = get_final_result(
@@ -399,6 +408,7 @@ def main():
         search_steps=args.search_steps,
     )
     print(info)
+    best_by_method['sum'] = info
 
     print("\n================= Find best f1 from score (method=mean) =================")
     info, test_scores, predict = get_final_result(
@@ -414,6 +424,18 @@ def main():
         search_steps=args.search_steps,
     )
     print(info)
+    best_by_method['mean'] = info
+
+    log_test_results(
+        logger,
+        dataset=args.data,
+        model=args.model,
+        checkpoint_path=model_path,
+        score_mean=score_mean,
+        loss1_mean=loss1_mean,
+        loss2_mean=loss2_mean,
+        best_by_method=best_by_method,
+    )
 
 
 if __name__ == '__main__':

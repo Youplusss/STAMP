@@ -5,6 +5,7 @@ import os
 import json
 from typing import Any, Dict, List, Optional
 import sys
+import re
 
 import numpy as np
 
@@ -66,6 +67,200 @@ def _feature_name(idx: int, nnodes: Optional[int] = None, out_channels: int = 1)
             return f"sensor_{idx}"
     return f"feature_{idx}"
 
+
+# -----------------------------------------------------------------------------
+# LLM RCA helpers (module-scope)
+# -----------------------------------------------------------------------------
+
+
+def _safe_json_loads(text: str) -> Optional[Dict[str, Any]]:
+    """Best-effort JSON extractor (handles extra surrounding text)."""
+    if not text:
+        return None
+    t = str(text).strip()
+    try:
+        return json.loads(t)
+    except Exception:
+        pass
+
+    m = re.search(r"\{.*\}", t, flags=re.DOTALL)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except Exception:
+        return None
+
+
+def _is_safe_evidence_ref(ref: str) -> bool:
+    """Restrict evidence_refs to known prefixes so the model can't cite random stuff."""
+    if not isinstance(ref, str):
+        return False
+    ref = ref.strip()
+    allowed = (
+        "Z_LAST:",
+        "PATTERN:",
+        "BRANCH:",
+        "MSE:",
+        "SEG_LEN:",
+        "SCORE:",
+        "CONTRIB:",
+    )
+    return ref.startswith(allowed)
+
+
+def _extract_branch_dominant(feature_rows: List[Dict[str, Any]]) -> str:
+    pred_dom = recon_dom = gen_dom = 0.0
+    for r in feature_rows:
+        bs = (r.get('branch_score_peak') or {})
+        pred_dom += float(bs.get('pred', 0.0))
+        recon_dom += float(bs.get('recon', 0.0))
+        gen_dom += float(bs.get('gen', 0.0))
+    denom = (abs(pred_dom) + abs(recon_dom) + abs(gen_dom) + 1e-9)
+    ratios = {
+        'pred': abs(pred_dom) / denom,
+        'recon': abs(recon_dom) / denom,
+        'gen': abs(gen_dom) / denom,
+    }
+    k = max(ratios.keys(), key=lambda x: ratios[x])
+    return f"{k}_dominant"
+
+
+def _build_rca_evidence_refs(feature_rows: List[Dict[str, Any]], seg: Dict[str, Any]) -> List[str]:
+    refs: List[str] = []
+
+    seg_len = int(seg.get('end', 0)) - int(seg.get('start', 0)) + 1
+    refs.append(f"SEG_LEN: {seg_len}")
+
+    dom = _extract_branch_dominant(feature_rows)
+    refs.append(f"BRANCH: {dom}")
+
+    for fe in (feature_rows or [])[:5]:
+        name = str(fe.get('name', ''))
+        pat = fe.get('pattern', {}) or {}
+        base = fe.get('baseline', {}) or {}
+        mse = fe.get('mse_peak', {}) or {}
+        try:
+            z = float(base.get('z_last_global'))
+        except Exception:
+            z = 0.0
+
+        at = str(pat.get('anomaly_type', 'unknown'))
+        ad = str(pat.get('direction', 'unknown'))
+        refs.append(f"PATTERN: {name} {at}({ad})")
+        refs.append(f"Z_LAST: {name} {z:.2f}")
+        refs.append(
+            f"MSE: {name} pred={float(mse.get('pred', 0.0)):.4g} recon={float(mse.get('recon', 0.0)):.4g}"
+        )
+        refs.append(f"SCORE: {name} {float(fe.get('score', 0.0)):.4f}")
+        refs.append(f"CONTRIB: {name} {float(fe.get('contribution', 0.0)):.3f}")
+
+    # de-dup while keeping order
+    seen = set()
+    out: List[str] = []
+    for r in refs:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def _llm_root_cause_actions(
+    *,
+    explainer: Any,
+    dataset: str,
+    window_size: int,
+    n_pred: int,
+    segment_info: Dict[str, Any],
+    feature_evidence: List[Dict[str, Any]],
+    global_evidence: Dict[str, Any],
+    language: str,
+) -> Optional[Dict[str, List[str]]]:
+    """Ask LLM for structured RCA/actions. Returns {causes:[...], actions:[...]} or None.
+
+    Safety strategy:
+      - Force STRICT JSON output.
+      - Force evidence_refs to use allowed prefixes.
+      - Require each bullet to cite >=1 evidence_refs.
+      - If anything fails, return None (caller falls back to heuristic).
+    """
+    try:
+        prompt = build_anomaly_explanation_prompt(
+            dataset=dataset,
+            window_size=window_size,
+            n_pred=n_pred,
+            segment_info=segment_info,
+            feature_evidence=feature_evidence,
+            global_evidence=global_evidence,
+            language=language,
+            output_format='json',
+        )
+
+        allowed_refs = _build_rca_evidence_refs(feature_evidence, segment_info)
+        prompt = (
+            prompt
+            + "\n【可引用证据列表（必须从中选择）】\n"
+            + "\n".join(f"- {r}" for r in allowed_refs)
+            + "\n"
+        )
+
+        raw = explainer.explain(
+            prompt,
+            {
+                "dataset": dataset,
+                "segment": segment_info,
+                "features": feature_evidence,
+                "global": global_evidence,
+                "allowed_evidence_refs": allowed_refs,
+            },
+        )
+
+        obj = _safe_json_loads(raw)
+        if not isinstance(obj, dict):
+            return None
+
+        rc = obj.get('root_causes')
+        ac = obj.get('actions')
+        if not isinstance(rc, list) or not isinstance(ac, list):
+            return None
+
+        def _clean_list(items: List[Any], min_n: int, max_n: int) -> Optional[List[str]]:
+            out_items: List[str] = []
+            for it in items:
+                if not isinstance(it, dict):
+                    continue
+                text = str(it.get('text', '')).strip()
+                if not text:
+                    continue
+                refs = it.get('evidence_refs', [])
+                if not isinstance(refs, list) or not refs:
+                    continue
+                # Validate refs by prefix; keep it strict
+                if not all(_is_safe_evidence_ref(str(r)) for r in refs):
+                    continue
+
+                out_items.append(text)
+                if len(out_items) >= max_n:
+                    break
+
+            if len(out_items) < min_n:
+                return None
+            return out_items
+
+        causes = _clean_list(rc, 2, 5)
+        actions = _clean_list(ac, 3, 7)
+        if causes is None or actions is None:
+            return None
+
+        # IMPORTANT: keep output as plain list[str] for md
+        return {"causes": causes, "actions": actions}
+    except Exception:
+        return None
+
+
+# -----------------------------------------------------------------------------
+# Main pipeline
+# -----------------------------------------------------------------------------
 
 def generate_explanations(
     *,
@@ -308,6 +503,7 @@ def generate_explanations(
             feature_evidence=feature_evidence,
             global_evidence=global_evidence,
             language=language,
+            output_format='markdown',
         )
 
         # call explainer
@@ -373,33 +569,91 @@ def generate_explanations(
         md_lines.append("- **min/max/last**: 峰值窗口内该变量的最小/最大/末尾值（来自原始窗口序列）")
         md_lines.append("")
 
-        def _root_cause_and_actions(feature_rows: List[Dict[str, Any]]) -> Dict[str, List[str]]:
-            """Heuristic root-cause suggestions based on evidence only (no domain semantics)."""
+        def _root_cause_and_actions(feature_rows: List[Dict[str, Any]], seg: Dict[str, Any], global_ev: Dict[str, Any]) -> Dict[str, List[str]]:
+            """Heuristic fallback when LLM RCA is unavailable."""
             causes: List[str] = []
             actions: List[str] = []
 
+            if not feature_rows:
+                return {
+                    "causes": ["证据为空：当前段没有可用的 Top-K 特征证据，无法给出更细的根因推断。"],
+                    "actions": ["请检查特征提取/打分流程是否正常，或提高 explain_topk_features。"],
+                }
+
+            seg_len = int(seg.get('end', 0)) - int(seg.get('start', 0)) + 1
+
             types = [str((r.get('pattern') or {}).get('anomaly_type', 'unknown')) for r in feature_rows]
-            if any(t in ('level_shift_up', 'level_shift_down') for t in types):
-                causes.append("出现水平漂移（level shift）：可能是系统工况切换、标定变化、或传感器偏置变化。")
-                actions.append("核对该时间段是否有操作/工况切换/配置变更；对比异常前后均值是否整体抬升/下降。")
-            if any(t == 'spike' for t in types):
-                causes.append("出现尖峰（spike）：可能是瞬时噪声、采样抖动、或短暂外部扰动。")
-                actions.append("检查原始数据是否有单点尖峰/丢包补零；查看同一时刻是否多变量同步尖峰。")
-            if any(t == 'variance_increase' for t in types):
-                causes.append("波动增大（variance increase）：可能是系统进入不稳定状态或噪声增加。")
-                actions.append("对比异常前后方差/振幅；检查是否存在控制环震荡或负载变化。")
-            if any(t == 'oscillation' for t in types):
-                causes.append("出现振荡（oscillation）：可能是控制回路震荡、周期性扰动或反馈异常。")
-                actions.append("检查是否存在周期性模式；对齐控制日志/告警，定位是否有周期控制动作。")
+            n_spike = sum(t == 'spike' for t in types)
+            n_dip = sum(t == 'dip' for t in types)
+            n_shift = sum(t.startswith('level_shift') or t == 'level_shift' for t in types)
+            n_var = sum(t == 'variance_increase' for t in types)
+            n_osc = sum(t == 'oscillation' for t in types)
+            n_unknown = sum(t == 'unknown' for t in types)
 
-            if not causes:
-                causes.append("形态未能明确归类：可能为多因素耦合异常或证据不足。")
-                actions.append("优先检查贡献度最高的变量；结合日志/告警进一步定位。")
+            z_list: List[float] = []
+            for r in feature_rows:
+                b = r.get('baseline') or {}
+                try:
+                    z_list.append(float(b.get('z_last_global')))
+                except Exception:
+                    pass
+            z_abs_max = max((abs(z) for z in z_list), default=0.0)
 
-            # Always include a cross-variable check
-            actions.append("建议：查看 Top-K 变量之间的相关性是否在该异常段发生显著变化（耦合异常线索）。")
+            dom = _extract_branch_dominant(feature_rows)
 
-            return {"causes": causes, "actions": actions}
+            if seg_len <= 3:
+                causes.append(f"异常持续很短（len={seg_len}）：更像瞬时扰动/毛刺，或短暂采样异常。")
+            elif seg_len <= 20:
+                causes.append(f"异常持续中等（len={seg_len}）：可能是一次短期工况变化或短时间系统不稳定。")
+            else:
+                causes.append(f"异常持续较长（len={seg_len}）：更像状态切换/持续偏置/持续不稳定，而非单点毛刺。")
+
+            if n_shift > 0:
+                causes.append("Top-K 中出现水平漂移/阶跃（level shift）特征：可能存在工况切换、标定偏置变化或持续偏移。")
+            if n_osc > 0:
+                causes.append("Top-K 中出现振荡（oscillation）特征：可能存在周期性扰动或控制回路震荡。")
+            if n_var > 0:
+                causes.append("Top-K 中出现波动增大（variance increase）特征：可能进入噪声更大/不稳定的运行状态。")
+            if (n_spike + n_dip) > 0 and n_shift == 0 and n_osc == 0:
+                causes.append("Top-K 以尖峰/凹陷（spike/dip）为主：更偏向瞬时突变，而不是整体缓慢漂移。")
+
+            if z_abs_max >= 3.0:
+                causes.append(f"峰值窗口相对全局基线偏离很强（max |z|≈{z_abs_max:.2f}）：说明至少有变量远离其历史常态。")
+            elif z_abs_max >= 1.5:
+                causes.append(f"峰值窗口相对全局基线有一定偏离（max |z|≈{z_abs_max:.2f}）：可能是温和但一致的偏移/扰动。")
+            else:
+                causes.append(f"峰值窗口相对全局基线偏离不强（max |z|≈{z_abs_max:.2f}）：异常更可能来自模型误差结构/变量关系变化，而非单变量绝对值偏离。")
+
+            if dom:
+                causes.append(f"分支主导性：{dom}（用于理解异常更偏预测误差/重构误差/生成一致性误差）。")
+
+            if n_unknown >= max(2, len(feature_rows) // 2):
+                causes.append("Top-K 中有较多 unknown 形态：当前简单形态分类无法覆盖，可能是多因素耦合异常或证据不足。")
+
+            top_names = [str(r.get('name', '')) for r in feature_rows[:3] if r.get('name')]
+            if top_names:
+                actions.append(f"优先复核贡献最高的变量：{', '.join(top_names)}（查看原始曲线、是否存在饱和/常值/离群单点）。")
+            else:
+                actions.append("优先复核贡献最高的 Top-K 变量（查看原始曲线、是否存在饱和/常值/离群单点）。")
+
+            if n_shift > 0:
+                actions.append("对比异常段前后均值/中位数是否整体抬升或下降；若有日志/事件，核对该窗口附近是否发生工况切换/配置变更。")
+            if (n_spike + n_dip) > 0:
+                actions.append("检查是否存在单点尖峰/凹陷、缺失补零、或时间戳跳变；同时观察 Top-K 是否在同一时刻同步突变（共因线索）。")
+            if n_osc > 0 or n_var > 0:
+                actions.append("检查异常段内方差/频谱/周期性是否显著增强；必要时按时间对齐控制/告警日志寻找周期性触发源。")
+
+            # Branch-oriented checks
+            if dom == 'pred_dominant':
+                actions.append("针对预测误差主导：重点检查异常前后变量间相关性/滞后关系是否变化；可尝试在该段用更短窗口做局部重训/校准验证。")
+            elif dom == 'recon_dominant':
+                actions.append("针对重构误差主导：重点检查分布漂移迹象（值域/均值/方差变化）；如果数据归一化范围变化，确认 min-max scaler 是否匹配当前数据。")
+            elif dom == 'gen_dominant':
+                actions.append("针对生成一致性误差主导：重点检查局部模式是否被破坏（例如周期被打断、趋势反转），并核对同期是否有异常操作。")
+
+            actions.append("补充验证：查看 Top-K 变量两两相关性在该段是否突变（耦合异常/链式传播线索），并与其他段对比。")
+
+            return {"causes": [c for c in causes if c.strip()], "actions": [a for a in actions if a.strip()]}
 
         for k, item in enumerate(explanations, 1):
             seg = item['segment']
@@ -416,13 +670,36 @@ def generate_explanations(
                 md_lines.append("> <EMPTY>")
             md_lines.append("")
 
-            # Root cause & actions (heuristic)
-            md_lines.append("### Root Cause (推测) & Suggested Actions (建议)")
-            rca = _root_cause_and_actions(item.get('feature_evidence', []))
-            md_lines.append("**可能根因：**")
+            # Root cause & actions: prefer LLM structured output, fallback to heuristic.
+            rca_llm = None
+            try:
+                # Use the same evidence that was used for the explanation
+                rca_llm = _llm_root_cause_actions(
+                    explainer=explainer,
+                    dataset=dataset_up,
+                    window_size=window_size,
+                    n_pred=n_pred,
+                    segment_info=seg,
+                    feature_evidence=item.get('feature_evidence', []),
+                    global_evidence=item.get('global_evidence', {}),
+                    language=language,
+                )
+            except Exception:
+                rca_llm = None
+
+            if rca_llm is None:
+                rca = _root_cause_and_actions(item.get('feature_evidence', []), seg=seg, global_ev=item.get('global_evidence', {}) or {})
+                rca_source = "heuristic"
+            else:
+                rca = rca_llm
+                rca_source = "llm"
+
+            md_lines.append(f"### Root Cause (推测)  (source={rca_source})")
             for c in rca["causes"]:
                 md_lines.append(f"- {c}")
-            md_lines.append("**建议处理：**")
+            md_lines.append("")
+
+            md_lines.append(f"### Suggested Actions (建议)  (source={rca_source})")
             for a in rca["actions"]:
                 md_lines.append(f"- {a}")
             md_lines.append("")
@@ -456,3 +733,4 @@ def generate_explanations(
             f.write("\n".join(md_lines))
 
     return result
+
