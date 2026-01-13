@@ -6,6 +6,30 @@ import argparse
 import torch
 
 
+def _parse_use_adv(v):
+    """Parse --use_adv flag.
+
+    Supports:
+    - 0/1/2 (recommended)
+    - True/False (backward compatible): True -> 2 (use current/stable adv), False -> 0
+    """
+    if isinstance(v, bool):
+        return 2 if v else 0
+    if isinstance(v, (int, float)):
+        iv = int(v)
+        if iv in (0, 1, 2):
+            return iv
+        raise argparse.ArgumentTypeError("--use_adv must be 0/1/2 or True/False")
+    s = str(v).strip().lower()
+    if s in ("0", "false", "no", "off"):
+        return 0
+    if s in ("1",):
+        return 1
+    if s in ("2", "true", "yes", "on"):
+        return 2
+    raise argparse.ArgumentTypeError("--use_adv must be 0/1/2 or True/False")
+
+
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description='STAMP Training (支持替换为 Mamba 预测/重构分支)')
 
@@ -84,8 +108,20 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
     # -------------------------- adversarial / coupled training (NEW) --------------------------
     # 为了调试与适配 Mamba，本 repo 的 Trainer 支持关闭对抗训练，以及多种更稳定的损失形式。
-    parser.add_argument('--use_adv', type=eval, default=True,
-                        help='whether to use adversarial/coupled training. False => only pred_loss + ae_loss (stable baseline).')
+    parser.add_argument(
+        '--use_adv',
+        type=_parse_use_adv,
+        default=2,
+        help='training loss mode: 0=no adversarial (weighted sum baseline), 1=legacy4 (tmp/trainer.py original), 2=current stabilized design. '
+             'Also accepts True/False for backward compatibility (True->2, False->0).'
+    )
+
+    # baseline (use_adv=0) weights
+    parser.add_argument('--loss_weight_pred', type=float, default=1.0,
+                        help='(use_adv=0) weight for prediction loss')
+    parser.add_argument('--loss_weight_ae', type=float, default=1.0,
+                        help='(use_adv=0) weight for reconstruction loss')
+
     parser.add_argument('--adv_train_strategy', type=str, default='legacy4',
                         choices=['legacy4', '4step', '2step'],
                         help='legacy4: original 4 updates per batch + 5/e,3/e schedule; '

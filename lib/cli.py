@@ -4,6 +4,30 @@ import argparse
 CLI_VERSION = "2025-12-29-recon-model"
 
 
+def _parse_use_adv(v):
+    """Parse --use_adv flag.
+
+    Supports:
+    - 0/1/2 (recommended)
+    - True/False (backward compatible): True -> 2, False -> 0
+    """
+    if isinstance(v, bool):
+        return 2 if v else 0
+    if isinstance(v, (int, float)):
+        iv = int(v)
+        if iv in (0, 1, 2):
+            return iv
+        raise argparse.ArgumentTypeError("--use_adv must be 0/1/2 or True/False")
+    s = str(v).strip().lower()
+    if s in ("0", "false", "no", "off"):
+        return 0
+    if s in ("1",):
+        return 1
+    if s in ("2", "true", "yes", "on"):
+        return 2
+    raise argparse.ArgumentTypeError("--use_adv must be 0/1/2 or True/False")
+
+
 def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
     """Add CLI arguments shared by train/test and sup/unsup entrypoints."""
 
@@ -107,41 +131,27 @@ def add_common_args(parser: argparse.ArgumentParser) -> argparse.ArgumentParser:
                         help='freeze the other branch during adversarial/coupled update to save memory')
 
     # ---- Stabilized adversarial training (recommended for Mamba models) ----
-    parser.add_argument('--use_adv', type=eval, default=True,
-                        help='whether to use adversarial/coupled training (True) or only pred+recon base losses (False).')
-    parser.add_argument('--adv_train_strategy', type=str, default='2step', choices=['legacy4', '4step', '2step'],
-                        help='legacy4: original 4 updates per batch + 5/e,3/e schedule; '
-                             '4step: 4 updates but stabilized objectives; '
-                             '2step: 2 updates (GAN-style), recommended for Mamba.')
-    parser.add_argument('--adv_scope', type=str, default='pred', choices=['full', 'pred', 'history'],
-                        help='where to compute adversarial reconstruction loss on generated window: '
-                             'full=whole window; pred=only last n_pred steps (recommended); history=only context part.')
-    parser.add_argument('--adv_mode', type=str, default='hinge', choices=['hinge', 'softplus', 'exp', 'legacy'],
-                        help='AE adversarial objective. legacy: ae_loss - lambda*adv_loss (can diverge). '
-                             'hinge/softplus/exp are bounded variants (recommended for Mamba).')
-    parser.add_argument('--adv_margin', type=float, default=0.1,
-                        help='Margin for hinge adversarial penalty: encourage adv_loss >= ae_loss + margin.')
-    parser.add_argument('--adv_margin_mode', type=str, default='rel', choices=['abs', 'rel'],
-                        help='margin type: abs => adv_loss >= ae_loss + margin; rel => adv_loss >= (1+margin)*ae_loss (scale-invariant).')
-    parser.add_argument('--adv_tau', type=float, default=1.0,
-                        help='Temperature for exp adversarial penalty exp(-adv/tau).')
-    parser.add_argument('--adv_lambda_pred', type=float, default=0.5,
-                        help='Max weight for adv loss in pred model update (after warmup+ramp).')
-    parser.add_argument('--adv_lambda_ae', type=float, default=1.0,
-                        help='Max weight for adversarial penalty in AE update (after warmup+ramp).')
-    parser.add_argument('--adv_warmup_epochs', type=int, default=1,
-                        help='Warmup epochs before enabling adversarial coupling.')
-    parser.add_argument('--adv_ramp_epochs', type=int, default=5,
-                        help='Ramp epochs to linearly increase adversarial weights after warmup.')
-    parser.add_argument('--clip_grad_norm_pred', type=float, default=1.0,
-                        help='Gradient clipping (L2 norm) for prediction model. Set 0 to disable.')
-    parser.add_argument('--clip_grad_norm_ae', type=float, default=1.0,
-                        help='Gradient clipping (L2 norm) for reconstruction model. Set 0 to disable.')
-    parser.add_argument('--pred_weight_decay', type=float, default=1e-4,
-                        help='Weight decay for prediction model optimizer.')
-    parser.add_argument('--ae_weight_decay', type=float, default=1e-4,
-                        help='Weight decay for reconstruction model optimizer.')
+    parser.add_argument('--use_adv', type=_parse_use_adv, default=2,
+                        help='training loss mode: 0=no adversarial (weighted sum baseline), 1=legacy4 (tmp/trainer.py original), 2=current stabilized design. '
+                             'Also accepts True/False for backward compatibility (True->2, False->0).')
 
+    # baseline (use_adv=0) weights
+    parser.add_argument('--loss_weight_pred', type=float, default=1.0,
+                        help='(use_adv=0) weight for prediction loss')
+    parser.add_argument('--loss_weight_ae', type=float, default=1.0,
+                        help='(use_adv=0) weight for reconstruction loss')
+
+    # AE / recon loss weights (used when not using adversarial training)
+    parser.add_argument('--pred_loss_weight', type=float, default=1.0,
+                        help='(use_adv=0) weight for prediction loss (legacy)')
+    parser.add_argument('--ae_loss_weight', type=float, default=1.0,
+                        help='(use_adv=0) weight for reconstruction loss (legacy)')
+
+    # ---- Shared between pred and recon models ----
+    parser.add_argument('--shared_emb', default=False, type=eval,
+                        help='(legacy) use shared embedding between pred and recon models')
+    parser.add_argument('--shared_attn', default=False, type=eval,
+                        help='(legacy) use shared attention between pred and recon models')
 
     # -------------------------- Mamba Forecast params --------------------------
     parser.add_argument('--mamba_use_mas', default=True, type=eval,

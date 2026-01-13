@@ -101,9 +101,27 @@ class Trainer(object):
         return output, batch
 
     # -------------------------- adversarial helpers --------------------------
-    def _use_adv(self) -> bool:
-        # default True to preserve legacy behaviour if user doesn't provide the flag
-        return bool(getattr(self.args, 'use_adv', True))
+    def _use_adv(self) -> int:
+        """Which loss design to use.
+
+        0: no adversarial coupling; use weighted sum baseline (pred + ae)
+        1: legacy adversarial training (match tmp/trainer.py legacy4)
+        2: current stabilized adversarial design (pred_total_loss/ae_total_loss)
+
+        Backward compatibility:
+        - True => 2
+        - False => 0
+        """
+        v = getattr(self.args, 'use_adv', 2)
+        if isinstance(v, bool):
+            return 2 if v else 0
+        try:
+            iv = int(v)
+        except Exception:
+            return 2
+        if iv in (0, 1, 2):
+            return iv
+        return 2
 
     def _adv_strategy(self) -> str:
         # legacy4: original 4-step schedule in STAMP code (potentially unstable for Mamba)
@@ -206,7 +224,9 @@ class Trainer(object):
         self.pred_model.eval()
         self.ae_model.eval()
 
-        use_adv = self._use_adv()
+        use_adv_mode = self._use_adv()
+
+        # for mode=2 (stabilized)
         adv_strategy = self._adv_strategy()
         adv_scope = self._adv_scope()
         adv_mode = self._adv_mode()
@@ -224,6 +244,21 @@ class Trainer(object):
         began_lambda_k = self._began_lambda_k()
         lam_pred, lam_ae = self._adv_lambdas(epoch)
 
+        # legacy schedule coefficients (for mode=1)
+        start_epoch = 0
+        e = max(epoch - start_epoch, 1)
+        legacy_a = 5.0 / e
+        legacy_b = 1.0 - 1.0 / e
+        legacy_c = 3.0 / e
+        legacy_d = 1.0 - 1.0 / e
+        # allow global scaling via adv_lambda_* (keep legacy defaults=1)
+        legacy_b = legacy_b * float(getattr(self.args, 'adv_lambda_pred', 1.0))
+        legacy_d = legacy_d * float(getattr(self.args, 'adv_lambda_ae', 1.0))
+
+        # baseline weights (for mode=0)
+        w_pred = float(getattr(self.args, 'loss_weight_pred', getattr(self.args, 'pred_loss_weight', 1.0)))
+        w_ae = float(getattr(self.args, 'loss_weight_ae', getattr(self.args, 'ae_loss_weight', 1.0)))
+
         total_val_pred_loss_list = []
         total_val_ae_loss_list = []
         total_val_adv_loss_list = []
@@ -232,8 +267,6 @@ class Trainer(object):
         loss2_list = []
         start_val = time.time()
 
-
-        start_epoch = 0
         with torch.no_grad():
             pbar = _progress(
                 val_dataloader,
@@ -260,35 +293,42 @@ class Trainer(object):
                 output, target = self.ae_model_batch(batch, training=False)
                 ae_loss = self._recon_loss_from_flat(output, target, scope='full')
                 if not torch.isnan(ae_loss):
-                    total_val_ae_loss_list .append(ae_loss.item())
+                    total_val_ae_loss_list.append(ae_loss.item())
 
                 if self.args.real_value:
-                    generate_batch = self.scaler.transform(generate_batch.reshape(-1, self.args.window_size, self.args.nnodes * self.args.out_channels).detach().cpu().numpy())
-                    generate_batch = torch.from_numpy(generate_batch).float().view(-1, self.args.window_size, self.args.nnodes, self.args.out_channels).to \
-                        (batch.device)
+                    generate_batch = self.scaler.transform(
+                        generate_batch.reshape(-1, self.args.window_size, self.args.nnodes * self.args.out_channels)
+                        .detach()
+                        .cpu()
+                        .numpy()
+                    )
+                    generate_batch = (
+                        torch.from_numpy(generate_batch)
+                        .float()
+                        .view(-1, self.args.window_size, self.args.nnodes, self.args.out_channels)
+                        .to(batch.device)
+                    )
 
                 output2, target2 = self.ae_model_batch(generate_batch, training=False)
                 adv_loss = self._recon_loss_from_flat(output2, target2, scope=adv_scope)
                 if not torch.isnan(adv_loss):
                     total_val_adv_loss_list.append(adv_loss.item())
 
-                # loss1/loss2 are *logging* losses. Checkpoint metric uses val_pred_loss + val_ae_loss.
-                if not use_adv:
-                    loss1 = float(pred_loss.item())
-                    loss2 = float(ae_loss.item())
+                # loss1/loss2: for logging
+                if use_adv_mode == 0:
+                    # no adversarial: weighted sum baseline
+                    loss1_t = w_pred * pred_loss + w_ae * ae_loss
+                    loss2_t = ae_loss
+                elif use_adv_mode == 1:
+                    # tmp/trainer.py original design (legacy4)
+                    loss1_t = legacy_a * pred_loss + legacy_b * adv_loss
+                    loss2_t = legacy_c * ae_loss - legacy_d * adv_loss
                 else:
+                    # current stabilized design
                     if adv_strategy == 'legacy4':
-                        # keep legacy schedule for reference
-                        e = max(epoch - start_epoch, 1)
-                        a = 5.0 / e
-                        b = 1.0 - 1.0 / e
-                        c = 3.0 / e
-                        d = 1.0 - 1.0 / e
-                        # allow global scaling via adv_lambda_* (default=1)
-                        b = b * float(getattr(self.args, 'adv_lambda_pred', 1.0))
-                        d = d * float(getattr(self.args, 'adv_lambda_ae', 1.0))
-                        loss1 = float((a * pred_loss + b * adv_loss).item())
-                        loss2 = float((c * ae_loss - d * adv_loss).item())
+                        # keep legacy schedule for reference (same as use_adv=1 but under mode=2)
+                        loss1_t = legacy_a * pred_loss + legacy_b * adv_loss
+                        loss2_t = legacy_c * ae_loss - legacy_d * adv_loss
                     else:
                         loss1_t, _, _ = pred_total_loss(
                             pred_loss,
@@ -306,10 +346,8 @@ class Trainer(object):
                             energy_transform_mode=adv_energy_tr,
                             auto_balance=adv_auto_balance,
                         )
-                        loss1 = float(loss1_t.item())
 
                         if adv_mode == 'began':
-                            # BEGAN-style logging loss (do NOT update k in validation)
                             E_fake = energy_transform(adv_loss, adv_energy_tr)
                             k = float(getattr(self, '_began_k', 0.0))
                             loss2_t = ae_loss - (lam_ae * k) * E_fake
@@ -329,18 +367,13 @@ class Trainer(object):
                                 energy_transform_mode=adv_energy_tr,
                                 auto_balance=adv_auto_balance,
                             )
-                        loss2 = float(loss2_t.item())
 
+                loss1 = float(loss1_t.item())
+                loss2 = float(loss2_t.item())
                 loss1_list.append(loss1)
                 loss2_list.append(loss2)
 
-                pbar.set_postfix({
-                    'pred': f"{pred_loss.item():.4f}",
-                    'ae': f"{ae_loss.item():.4f}",
-                    'adv': f"{adv_loss.item():.4f}",
-                    'L1': f"{loss1:.4f}",
-                    'L2': f"{loss2:.4f}",
-                })
+                pbar.set_postfix({'pred': f"{pred_loss.item():.4f}", 'ae': f"{ae_loss.item():.4f}", 'adv': f"{adv_loss.item():.4f}", 'L1': f"{loss1:.4f}", 'L2': f"{loss2:.4f}"})
 
         val_pred_loss = np.array(total_val_pred_loss_list).mean()
         val_ae_loss = np.array(total_val_ae_loss_list).mean()
@@ -360,7 +393,9 @@ class Trainer(object):
         self.pred_model.train()
         self.ae_model.train()
 
-        use_adv = self._use_adv()
+        use_adv_mode = self._use_adv()
+
+        # for mode=2 (stabilized)
         adv_strategy = self._adv_strategy()
         adv_scope = self._adv_scope()
         adv_mode = self._adv_mode()
@@ -389,7 +424,6 @@ class Trainer(object):
 
         do_clip = bool(getattr(self.args, 'grad_clip', False))
         max_grad_norm_default = float(getattr(self.args, 'max_grad_norm', 1.0))
-        # optional per-branch clip norms (used by lib/cli.py); fall back to max_grad_norm
         max_grad_norm_pred = float(getattr(self.args, 'clip_grad_norm_pred', max_grad_norm_default))
         max_grad_norm_ae = float(getattr(self.args, 'clip_grad_norm_ae', max_grad_norm_default))
 
@@ -401,6 +435,10 @@ class Trainer(object):
         legacy_d = 1.0 - 1.0 / e
         legacy_b = legacy_b * float(getattr(self.args, 'adv_lambda_pred', 1.0))
         legacy_d = legacy_d * float(getattr(self.args, 'adv_lambda_ae', 1.0))
+
+        # baseline weights (for mode=0)
+        w_pred = float(getattr(self.args, 'loss_weight_pred', getattr(self.args, 'pred_loss_weight', 1.0)))
+        w_ae = float(getattr(self.args, 'loss_weight_ae', getattr(self.args, 'ae_loss_weight', 1.0)))
 
         pbar = _progress(
             self.train_loader,
@@ -421,34 +459,40 @@ class Trainer(object):
                 batch, mas = batch_m[0], None
                 batch = batch.to(self.args.device, non_blocking=True)
 
-            # -------------------- (A) no adversarial coupling --------------------
-            if not use_adv:
-                # 1) pred update
+            # -------------------- (A) use_adv=0: no adversarial, weighted sum --------------------
+            if use_adv_mode == 0:
+                # pred update
                 self.pred_optimizer.zero_grad(set_to_none=True)
                 out, tgt, _ = self.pred_model_batch(batch, training=True, mas=mas)
                 pred_loss = self.pred_loss(out, tgt)
-                pred_loss.backward()
+
+                # AE forward (for joint objective) - do NOT update AE grads during pred step
+                with torch.no_grad():
+                    recon_flat, real_flat = self.ae_model_batch(batch, training=False)
+                    ae_loss = self._recon_loss_from_flat(recon_flat, real_flat, scope='full')
+
+                loss1_t = w_pred * pred_loss + w_ae * ae_loss
+                loss1_t.backward()
                 if do_clip and max_grad_norm_pred > 0:
                     torch.nn.utils.clip_grad_norm_(self.pred_model.parameters(), max_grad_norm_pred)
                 self.pred_optimizer.step()
 
-                # 2) AE update
+                # AE update (pure reconstruction)
                 self.ae_optimizer.zero_grad(set_to_none=True)
-                recon_flat, real_flat = self.ae_model_batch(batch, training=True)
-                ae_loss = self._recon_loss_from_flat(recon_flat, real_flat, scope='full')
-                ae_loss.backward()
+                recon_flat2, real_flat2 = self.ae_model_batch(batch, training=True)
+                ae_loss2 = self._recon_loss_from_flat(recon_flat2, real_flat2, scope='full')
+                ae_loss2.backward()
                 if do_clip and max_grad_norm_ae > 0:
                     torch.nn.utils.clip_grad_norm_(self.ae_model.parameters(), max_grad_norm_ae)
                 self.ae_optimizer.step()
 
-                loss1_list.append(float(pred_loss.item()))
-                loss2_list.append(float(ae_loss.item()))
-                pbar.set_postfix({'pred': f"{pred_loss.item():.4f}", 'ae': f"{ae_loss.item():.4f}"})
+                loss1_list.append(float(loss1_t.item()))
+                loss2_list.append(float(ae_loss2.item()))
+                pbar.set_postfix({'L': f"{loss1_t.item():.4f}", 'pred': f"{pred_loss.item():.4f}", 'ae': f"{ae_loss2.item():.4f}"})
                 continue
 
-            # -------------------- (B) adversarial / coupled training --------------------
-            if adv_strategy == 'legacy4':
-                # === 4-step legacy STAMP (kept for reference / ablation) ===
+            # -------------------- (B) use_adv=1: legacy4 (tmp/trainer.py) --------------------
+            if use_adv_mode == 1:
                 # 1) pred base update
                 self.pred_optimizer.zero_grad(set_to_none=True)
                 out, tgt, _ = self.pred_model_batch(batch, training=True, mas=mas)
@@ -467,13 +511,12 @@ class Trainer(object):
                     torch.nn.utils.clip_grad_norm_(self.ae_model.parameters(), max_grad_norm_ae)
                 self.ae_optimizer.step()
 
-                # 3) pred coupled update (legacy weights)
+                # 3) pred coupled update
                 self.pred_optimizer.zero_grad(set_to_none=True)
                 out, tgt, gen = self.pred_model_batch(batch, training=True, mas=mas)
-                pred_loss = self.pred_loss(out, tgt)
+                pred_loss2 = self.pred_loss(out, tgt)
 
                 if self.args.real_value:
-                    # NOTE: uses numpy -> breaks gradients; keep for compatibility.
                     gen = self.scaler.transform(
                         gen.reshape(-1, self.args.window_size, self.args.nnodes * self.args.out_channels)
                         .detach()
@@ -494,16 +537,16 @@ class Trainer(object):
                     _set_requires_grad(self.ae_model, True)
 
                 adv_loss = self._recon_loss_from_flat(recon_gen_flat, gen_flat, scope=adv_scope)
-                loss1 = legacy_a * pred_loss + legacy_b * adv_loss
-                loss1.backward()
+                loss1_t = legacy_a * pred_loss2 + legacy_b * adv_loss
+                loss1_t.backward()
                 if do_clip and max_grad_norm_pred > 0:
                     torch.nn.utils.clip_grad_norm_(self.pred_model.parameters(), max_grad_norm_pred)
                 self.pred_optimizer.step()
 
-                # 4) AE adversarial update (legacy min-max)
+                # 4) AE adversarial update
                 self.ae_optimizer.zero_grad(set_to_none=True)
-                recon_flat, real_flat = self.ae_model_batch(batch, training=True)
-                ae_loss = self._recon_loss_from_flat(recon_flat, real_flat, scope='full')
+                recon_flat3, real_flat3 = self.ae_model_batch(batch, training=True)
+                ae_loss3 = self._recon_loss_from_flat(recon_flat3, real_flat3, scope='full')
 
                 if adv_freeze_other:
                     _set_requires_grad(self.pred_model, False)
@@ -514,21 +557,22 @@ class Trainer(object):
 
                 recon_gen_flat2, gen_flat2 = self.ae_model_batch(gen2, training=True)
                 adv_loss2 = self._recon_loss_from_flat(recon_gen_flat2, gen_flat2, scope=adv_scope)
-                loss2 = legacy_c * ae_loss - legacy_d * adv_loss2
-                loss2.backward()
+                loss2_t = legacy_c * ae_loss3 - legacy_d * adv_loss2
+                loss2_t.backward()
                 if do_clip and max_grad_norm_ae > 0:
                     torch.nn.utils.clip_grad_norm_(self.ae_model.parameters(), max_grad_norm_ae)
                 self.ae_optimizer.step()
 
-                loss1_list.append(float(loss1.item()))
-                loss2_list.append(float(loss2.item()))
-                pbar.set_postfix({'L1': f"{loss1.item():.4f}", 'L2': f"{loss2.item():.4f}"})
+                loss1_list.append(float(loss1_t.item()))
+                loss2_list.append(float(loss2_t.item()))
+                pbar.set_postfix({'L1': f"{loss1_t.item():.4f}", 'L2': f"{loss2_t.item():.4f}"})
                 continue
 
-            # === Stabilized strategies (recommended for Mamba) ===
-            # Optionally do an extra "base" update per batch (4step); otherwise 2step.
-            if adv_strategy == '4step':
-                # 1) pred base
+            # -------------------- (C) use_adv=2: current stabilized design (existing) --------------------
+            # (note: existing code below kept as-is)
+            if adv_strategy == 'legacy4':
+                # === 4-step legacy STAMP (kept for reference / ablation) ===
+                # 1) pred base update
                 self.pred_optimizer.zero_grad(set_to_none=True)
                 out, tgt, _ = self.pred_model_batch(batch, training=True, mas=mas)
                 pred_loss_base = self.pred_loss(out, tgt)
@@ -537,7 +581,7 @@ class Trainer(object):
                     torch.nn.utils.clip_grad_norm_(self.pred_model.parameters(), max_grad_norm_pred)
                 self.pred_optimizer.step()
 
-                # 2) AE base
+                # 2) AE base update
                 self.ae_optimizer.zero_grad(set_to_none=True)
                 recon_flat, real_flat = self.ae_model_batch(batch, training=True)
                 ae_loss_base = self._recon_loss_from_flat(recon_flat, real_flat, scope='full')
@@ -1134,6 +1178,9 @@ class AEModelTrainer(object):
             os.makedirs(log_dir, exist_ok=True)
         self.logger = get_logger(log_dir, name=args.model, debug=args.debug, data=args.data, tag='train', model=args.model, run_id=getattr(args, 'run_id', None), console=True)
         self.logger.info('Experiment log path in: {}'.format(log_dir))
+
+        # Ensure ae_channels exists (flattened [B, T, N, C])
+        self.ae_channels = self.args.window_size * self.args.nnodes * self.args.in_channels
 
     def ae_model_batch(self, batch, training=True):
         self.ae_model.train(training)
